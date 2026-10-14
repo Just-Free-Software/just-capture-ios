@@ -1,0 +1,146 @@
+import Foundation
+
+enum GmailService {
+    static func sendEmergencyEmail(to recipients: [String], subject: String, bodyNote: String, includeTime: Bool = true, address: String?, latitude: Double?, longitude: Double?, driveFolderLink: String?, accessToken: String) async throws {
+        let html = buildEmailHTML(
+            subject: subject,
+            includeTime: includeTime,
+            address: address,
+            latitude: latitude,
+            longitude: longitude,
+            driveFolderLink: driveFolderLink,
+            bodyNote: bodyNote
+        )
+        
+        let htmlBase64 = html.data(using: .utf8)?.base64EncodedString(options: .lineLength76Characters) ?? ""
+        let to = recipients.joined(separator: ", ")
+        let subjectBase64 = subject.data(using: .utf8)?.base64EncodedString() ?? ""
+        let encodedSubject = "=?utf-8?B?" + subjectBase64 + "?="
+        
+        let mime = """
+        From: me
+        To: \(to)
+        Subject: \(encodedSubject)
+        MIME-Version: 1.0
+        Content-Type: text/html; charset=utf-8
+        Content-Transfer-Encoding: base64
+        X-Priority: 1
+        Importance: high
+
+        \(htmlBase64)
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        
+        guard let data = mime.data(using: .utf8) else { throw URLError(.unknown) }
+        let base64url = data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        
+        guard let url = URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/send") else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: Any] = ["raw": base64url]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        
+        let (responseData, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+            let errorString = String(data: responseData, encoding: .utf8) ?? "Unknown Error"
+            print("Gmail API Error: \(errorString)")
+            throw URLError(.badServerResponse)
+        }
+        
+        print("✅ Email sent successfully to \(recipients.joined(separator: ", "))!")
+    }
+    
+    private static func buildEmailHTML(subject: String, includeTime: Bool, address: String?, latitude: Double?, longitude: Double?, driveFolderLink: String?, bodyNote: String) -> String {
+        var template = loadTemplate()
+        
+        template = template.replacingOccurrences(of: "{{SUBJECT}}", with: subject)
+        
+        if includeTime {
+            let timestampFormatter = DateFormatter()
+            timestampFormatter.dateFormat = "MMM d, yyyy 'at' h:mm a zzz"
+            timestampFormatter.timeZone = .current
+            let timeString = timestampFormatter.string(from: Date())
+            let timeHtml = "<p style=\"color: #cccccc; font-size: 14px; margin-bottom: 20px;\"><strong>Recording Started:</strong> \(timeString)</p>"
+            template = template.replacingOccurrences(of: "{{TIMESTAMP_SECTION}}", with: timeHtml)
+            template = template.replacingOccurrences(of: "{{TIMESTAMP}}", with: timeString)
+        } else {
+            template = template.replacingOccurrences(of: "{{TIMESTAMP_SECTION}}", with: "")
+            template = template.replacingOccurrences(of: "{{TIMESTAMP}}", with: "")
+        }
+        
+        if let address = address, !address.isEmpty {
+            let addressHtml = "<p style=\"color: #e0e0e0; font-size: 14px; margin: 10px 0;\">📍 <strong>Location:</strong> \(address)</p>"
+            template = template.replacingOccurrences(of: "{{ADDRESS_SECTION}}", with: addressHtml)
+        } else {
+            template = template.replacingOccurrences(of: "{{ADDRESS_SECTION}}", with: "")
+        }
+        
+        if let lat = latitude, let lng = longitude {
+            let mapHtml = """
+            <p style="margin: 10px 0;">
+                <a href="https://www.google.com/maps?q=\(lat),\(lng)" style="color: #4da6ff; text-decoration: none; font-weight: 500;">
+                    📍 View location on Google Maps →
+                </a>
+            </p>
+            """
+            template = template.replacingOccurrences(of: "{{MAP_LINK_SECTION}}", with: mapHtml)
+        } else {
+            template = template.replacingOccurrences(of: "{{MAP_LINK_SECTION}}", with: "")
+        }
+        
+        if let link = driveFolderLink, !link.isEmpty {
+            let driveHtml = """
+            <p style="margin: 20px 0;">
+                <a href="\(link)" style="display: inline-block; padding: 12px 24px; background-color: #007bff; color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 14px;">
+                    View Live Recording on Google Drive
+                </a>
+            </p>
+            """
+            template = template.replacingOccurrences(of: "{{DRIVE_LINK_SECTION}}", with: driveHtml)
+        } else {
+            template = template.replacingOccurrences(of: "{{DRIVE_LINK_SECTION}}", with: "")
+        }
+        
+        if !bodyNote.isEmpty {
+            let noteHtml = """
+            <p style="background-color: #2a2a2a; border-left: 4px solid #ff4444; padding: 12px; border-radius: 4px; color: #e0e0e0; font-size: 14px; margin: 15px 0;">
+                📝 <strong>Note:</strong> \(bodyNote)
+            </p>
+            """
+            template = template.replacingOccurrences(of: "{{NOTE_SECTION}}", with: noteHtml)
+        } else {
+            template = template.replacingOccurrences(of: "{{NOTE_SECTION}}", with: "")
+        }
+        
+        return template
+    }
+    
+    private static func loadTemplate() -> String {
+        if let url = Bundle.main.url(forResource: "EmailTemplate", withExtension: "html"),
+           let content = try? String(contentsOf: url, encoding: .utf8) {
+            return content
+        }
+        
+        // Fallback default template if file cannot be loaded from bundle
+        return """
+        <!DOCTYPE html>
+        <html>
+        <body style="background-color: #121212; color: #ffffff; font-family: sans-serif; padding: 20px;">
+            <h2 style="color: #ff4444;">I am broadcasting</h2>
+            {{TIMESTAMP_SECTION}}
+            {{ADDRESS_SECTION}}
+            {{MAP_LINK_SECTION}}
+            {{DRIVE_LINK_SECTION}}
+            {{NOTE_SECTION}}
+            <br/><p style="color: #888888; font-size: 12px;">Sent via Just App 2</p>
+        </body>
+        </html>
+        """
+    }
+}
+
