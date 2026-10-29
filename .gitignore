@@ -1,0 +1,7 @@
+xcuserdata/
+DerivedData/
+.DS_Store
+*.xcuserstate
+
+# Internal design notes
+CONSIDERATIONS.md
