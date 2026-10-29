@@ -14,6 +14,9 @@ class UploadQueueManager {
     /// Called once a session's Drive folder exists, so alert emails that went
     /// out without a link can send it.
     var onFolderCreated: ((RecordingSession) -> Void)?
+    /// Called after each chunk lands in Drive, so the storage figure can be
+    /// updated without waiting for a quota refresh.
+    var onChunkUploaded: ((VideoChunk) -> Void)?
     private var uploadTasks: [UUID: Task<Void, Never>] = [:]
     /// One in-flight Drive folder creation per session. Without this, the
     /// recording start and the first chunk uploads each create their own
@@ -206,6 +209,7 @@ class UploadQueueManager {
                     chunk.driveFileId = fileId
                     storageExceeded = false
                     sessionStore?.save()
+                    onChunkUploaded?(chunk)
                     
                     if !Self.saveChunksLocally {
                         try? FileManager.default.removeItem(at: chunk.localURL)

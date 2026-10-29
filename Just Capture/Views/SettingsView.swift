@@ -276,7 +276,7 @@ struct SettingsView: View {
         switch driveStorageManager.state {
         case .ok, .low:
             if let quota = driveStorageManager.quota, let available = quota.availableBytes {
-                Text("\(Formatters.bytes(available)) free")
+                Text("\(DriveStorageManager.formatBytes(available)) free")
                     .foregroundStyle(driveStorageManager.state == .low ? Theme.warning : .secondary)
             }
         case .out:

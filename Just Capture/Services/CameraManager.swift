@@ -20,20 +20,42 @@ class CameraManager: NSObject {
     var recordingError: String?
     var onChunkCompleted: ((VideoChunk) -> Void)?
 
-    // Configured on sessionQueue, started/stopped from the main actor, as
-    // AVFoundation allows.
-    nonisolated(unsafe) private let movieFileOutput = AVCaptureMovieFileOutput()
+    // Configured on sessionQueue. Their sample buffers go to the recorder,
+    // which writes them into chunk files.
+    nonisolated(unsafe) private let videoDataOutput = AVCaptureVideoDataOutput()
+    nonisolated(unsafe) private let audioDataOutput = AVCaptureAudioDataOutput()
+    private let recorder = ChunkRecorder()
     private let sessionQueue = DispatchQueue(label: "com.justapp.camera.session")
 
     private var currentVideoDevice: AVCaptureDevice?
-    private var chunkDuration: TimeInterval = 30
-    private var outputDirectory: URL?
 
     private var recordingTimer: Timer?
-    private var chunkTimer: Timer?
     private var recordingStartDate: Date?
-    private var currentChunkStartDate: Date?
     private var isSessionConfigured = false
+    /// Keeps the app running long enough to finish the last chunk's file if
+    /// recording stopped because the app was backgrounded.
+    private var finishingActivity: BackgroundActivity?
+
+    override init() {
+        super.init()
+        recorder.onChunkStarted = { [weak self] index in
+            self?.currentChunkIndex = index
+        }
+        recorder.onChunkFinished = { [weak self] chunk in
+            self?.handleFinishedChunk(chunk)
+        }
+        recorder.onFailure = { [weak self] message in
+            guard let self, self.isRecording else { return }
+            self.recordingError = message
+            self.stopRecording()
+        }
+        recorder.onStopped = { [weak self] in
+            self?.isFinishing = false
+            self?.finishingActivity?.end()
+            self?.finishingActivity = nil
+        }
+        observeInterruptions()
+    }
 
     func setupSession() {
         guard !isSessionConfigured else { return }
@@ -73,8 +95,16 @@ class CameraManager: NSObject {
                 }
             }
 
-            if self.captureSession.canAddOutput(self.movieFileOutput) {
-                self.captureSession.addOutput(self.movieFileOutput)
+            // Late frames are dropped rather than queued so a slow encoder
+            // can't back up into the camera's buffer pool.
+            self.videoDataOutput.alwaysDiscardsLateVideoFrames = true
+            self.videoDataOutput.setSampleBufferDelegate(self.recorder, queue: self.recorder.queue)
+            if self.captureSession.canAddOutput(self.videoDataOutput) {
+                self.captureSession.addOutput(self.videoDataOutput)
+            }
+            self.audioDataOutput.setSampleBufferDelegate(self.recorder, queue: self.recorder.queue)
+            if self.captureSession.canAddOutput(self.audioDataOutput) {
+                self.captureSession.addOutput(self.audioDataOutput)
             }
             self.configureVideoConnection(mirrored: useFront)
 
@@ -86,24 +116,29 @@ class CameraManager: NSObject {
         }
     }
 
-    /// Applies orientation, stabilization and codec to the movie output's
-    /// video connection. The connection is rebuilt whenever the video input
-    /// changes, so this must run after every camera flip too.
+    /// Applies orientation, stabilization and mirroring to the video output's
+    /// connection and hands the recorder matching encoder settings. The
+    /// connection is rebuilt whenever the video input changes, so this must
+    /// run after every camera flip too.
     nonisolated private func configureVideoConnection(mirrored: Bool) {
-        guard let connection = movieFileOutput.connection(with: .video) else { return }
-        if connection.isVideoRotationAngleSupported(90) {
-            connection.videoRotationAngle = 90
+        if let connection = videoDataOutput.connection(with: .video) {
+            // Rotating here (not with a track transform) makes the frames
+            // themselves upright, so every player shows them the right way up.
+            if connection.isVideoRotationAngleSupported(90) {
+                connection.videoRotationAngle = 90
+            }
+            if connection.isVideoStabilizationSupported {
+                connection.preferredVideoStabilizationMode = .auto
+            }
+            if connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = mirrored
+            }
         }
-        if connection.isVideoStabilizationSupported {
-            connection.preferredVideoStabilizationMode = .auto
-        }
-        if connection.isVideoMirroringSupported {
-            connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = mirrored
-        }
-        if movieFileOutput.availableVideoCodecTypes.contains(.hevc) {
-            movieFileOutput.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: connection)
-        }
+        let codec: AVVideoCodecType = videoDataOutput.availableVideoCodecTypesForAssetWriter(writingTo: .mp4).contains(.hevc) ? .hevc : .h264
+        let videoSettings = videoDataOutput.recommendedVideoSettings(forVideoCodecType: codec, assetWriterOutputFileType: .mp4)
+        let audioSettings = audioDataOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mp4)
+        recorder.updateSettings(video: videoSettings, audio: audioSettings)
     }
 
     nonisolated private func getDevice(for position: AVCaptureDevice.Position) -> AVCaptureDevice? {
@@ -124,10 +159,30 @@ class CameraManager: NSObject {
         return discoverySession.devices.first
     }
 
+    /// A phone call, Siri, or another app taking the camera stops the flow
+    /// of frames. End the recording so the chunk so far is finished properly
+    /// rather than left open.
+    private func observeInterruptions() {
+        let center = NotificationCenter.default
+        center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: captureSession, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isRecording else { return }
+                self.recordingError = "Recording stopped because the camera was interrupted."
+                self.stopRecording()
+            }
+        }
+        center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: captureSession, queue: .main) { [weak self] notification in
+            let error = notification.userInfo?[AVCaptureSessionErrorKey] as? Error
+            MainActor.assumeIsolated {
+                guard let self, self.isRecording else { return }
+                self.recordingError = error?.localizedDescription ?? "The camera stopped recording unexpectedly."
+                self.stopRecording()
+            }
+        }
+    }
+
     func startRecording(chunkDuration: TimeInterval, outputDirectory: URL) {
         guard !isRecording, !isFinishing else { return }
-        self.chunkDuration = chunkDuration
-        self.outputDirectory = outputDirectory
         self.currentChunkIndex = 0
         self.elapsedTime = 0
         self.recordingError = nil
@@ -141,47 +196,15 @@ class CameraManager: NSObject {
             }
         }
 
-        startNextChunkSegment()
-    }
-
-    private func startNextChunkSegment() {
-        guard let dir = outputDirectory else { return }
-        let url = dir.appendingPathComponent("chunk_\(currentChunkIndex).mp4")
-
-        if FileManager.default.fileExists(atPath: url.path) {
-            try? FileManager.default.removeItem(at: url)
-        }
-
-        movieFileOutput.startRecording(to: url, recordingDelegate: self)
-        currentChunkStartDate = Date()
-        scheduleChunkTimer()
-    }
-
-    private func scheduleChunkTimer() {
-        chunkTimer?.invalidate()
-        chunkTimer = Timer.scheduledTimer(withTimeInterval: chunkDuration, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.handleChunkTimerFired()
-            }
-        }
-    }
-
-    private func handleChunkTimerFired() {
-        guard isRecording else { return }
-        movieFileOutput.stopRecording()
+        recorder.start(outputDirectory: outputDirectory, chunkDuration: chunkDuration)
     }
 
     /// Ends the current chunk immediately and hands it to the upload queue,
     /// without waiting for the configured chunk duration to elapse. The next
-    /// chunk starts automatically via the recording delegate.
+    /// chunk starts on the very next frame.
     func cutChunkNow() {
         guard isRecording else { return }
-        // Ignore taps within the first second of a chunk — a file that short
-        // isn't worth uploading and often can't be written validly yet.
-        if let chunkStart = currentChunkStartDate, Date().timeIntervalSince(chunkStart) < 1 { return }
-        chunkTimer?.invalidate()
-        chunkTimer = nil
-        movieFileOutput.stopRecording()
+        recorder.cutNow()
     }
 
     func stopRecording() {
@@ -189,14 +212,19 @@ class CameraManager: NSObject {
         isRecording = false
         recordingTimer?.invalidate()
         recordingTimer = nil
-        chunkTimer?.invalidate()
-        chunkTimer = nil
-        // currentChunkStartDate is left alone: the delegate still needs it to
-        // compute the final chunk's real duration.
-        if movieFileOutput.isRecording {
-            isFinishing = true
-            movieFileOutput.stopRecording()
+        isFinishing = true
+        finishingActivity = BackgroundActivity(name: "Finish recording")
+        recorder.stop()
+    }
+
+    private func handleFinishedChunk(_ chunk: RecordedChunk) {
+        if let error = chunk.errorDescription {
+            // Don't hand on a file that wasn't finished: it has no index and
+            // won't play. Earlier chunks are unaffected.
+            if recordingError == nil { recordingError = error }
+            return
         }
+        onChunkCompleted?(VideoChunk(index: chunk.index, localURL: chunk.url, duration: chunk.duration, fileSize: chunk.fileSize))
     }
 
     func toggleTorch() {
@@ -240,61 +268,6 @@ class CameraManager: NSObject {
             self.captureSession.commitConfiguration()
             Task { @MainActor in
                 self.currentVideoDevice = newDevice
-            }
-        }
-    }
-}
-
-extension CameraManager: AVCaptureFileOutputRecordingDelegate {
-    nonisolated func fileOutput(
-        _ output: AVCaptureFileOutput,
-        didFinishRecordingTo outputFileURL: URL,
-        from connections: [AVCaptureConnection],
-        error: Error?
-    ) {
-        let isSuccessfullyWritten: Bool
-        if let err = error as NSError? {
-            isSuccessfullyWritten = (err.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool) ?? false
-        } else {
-            isSuccessfullyWritten = true
-        }
-
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: outputFileURL.path)[.size] as? Int64) ?? 0
-
-        Task { @MainActor in
-            let chunkIndex = self.currentChunkIndex
-            let hasData = isSuccessfullyWritten && fileSize > 0
-
-            // Only emit chunks that were actually written with data. When the
-            // capture session is interrupted (backgrounding, a phone call) the
-            // delegate fires with empty/truncated files — emitting those would
-            // spam the upload queue with 0-byte chunks.
-            if hasData {
-                let actualDuration: TimeInterval
-                if let chunkStart = self.currentChunkStartDate {
-                    actualDuration = max(Date().timeIntervalSince(chunkStart), 0.01)
-                } else {
-                    actualDuration = self.chunkDuration
-                }
-                self.onChunkCompleted?(VideoChunk(index: chunkIndex, localURL: outputFileURL, duration: actualDuration, fileSize: fileSize))
-            }
-
-            if self.isRecording {
-                if !hasData {
-                    // A segment that produced nothing means the camera can't
-                    // record right now (interrupted, out of disk). Restarting
-                    // immediately would fail the same way in a tight loop.
-                    self.recordingError = error?.localizedDescription ?? "The camera stopped recording unexpectedly."
-                    self.stopRecording()
-                    self.isFinishing = false
-                    self.currentChunkStartDate = nil
-                    return
-                }
-                self.currentChunkIndex += 1
-                self.startNextChunkSegment()
-            } else {
-                self.isFinishing = false
-                self.currentChunkStartDate = nil
             }
         }
     }

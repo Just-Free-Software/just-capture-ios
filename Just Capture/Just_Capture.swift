@@ -32,6 +32,9 @@ struct Just_Capture: App {
                     uploadQueueManager.onFolderCreated = { [emailQueueManager, authManager] session in
                         emailQueueManager.sendLinkFollowUps(forSessionId: session.id, authManager: authManager)
                     }
+                    uploadQueueManager.onChunkUploaded = { [driveStorageManager, authManager] chunk in
+                        driveStorageManager.recordUpload(bytes: chunk.fileSize, authManager: authManager)
+                    }
                 }
                 .onOpenURL { url in
                     GIDSignIn.sharedInstance.handle(url)

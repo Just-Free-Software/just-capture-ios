@@ -163,7 +163,7 @@ struct RecordingView: View {
     
     private var driveStorageText: String {
         switch driveStorageManager.state {
-        case .ok: return driveStorageManager.availableBytes.map { "\(Formatters.bytes($0)) free" } ?? "Drive"
+        case .ok: return driveStorageManager.availableBytes.map { "\(DriveStorageManager.formatBytes($0)) free" } ?? "Drive"
         case .low: return "Drive low"
         case .out: return "Drive full"
         case .unlimited: return "Unlimited"
@@ -386,6 +386,8 @@ struct RecordingView: View {
     }
     
     private func handleStorageExceeded() {
+        // Show "Drive full" now rather than the last free-space figure.
+        driveStorageManager.markOutOfStorage()
         if let session = sessionStore.currentSession, session.isActive,
            storageEmailSentForSessionId != session.id {
             storageEmailSentForSessionId = session.id
