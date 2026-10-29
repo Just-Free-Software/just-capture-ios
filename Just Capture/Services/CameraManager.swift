@@ -166,7 +166,9 @@ class CameraManager: NSObject {
         let center = NotificationCenter.default
         center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: captureSession, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.isRecording else { return }
+                guard let self else { return }
+                self.recorder.discardPreparedWriter()
+                guard self.isRecording else { return }
                 self.recordingError = "Recording stopped because the camera was interrupted."
                 self.stopRecording()
             }
