@@ -1,6 +1,7 @@
 //  ContentView.swift
 
 import SwiftUI
+import UIKit
 import GoogleSignIn
 
 struct ContentView: View {
@@ -16,6 +17,9 @@ struct ContentView: View {
     var body: some View {
         content
             .onChange(of: cameraManager.isRecording) { wasRecording, isRecording in
+                // Auto-lock would background the app, which suspends the camera
+                // and ends the recording, so the screen stays on while recording.
+                UIApplication.shared.isIdleTimerDisabled = isRecording
                 // Single place that finalizes a session, whichever path stopped
                 // recording (stop button, backgrounding, sign-out, camera failure).
                 guard wasRecording, !isRecording else { return }
