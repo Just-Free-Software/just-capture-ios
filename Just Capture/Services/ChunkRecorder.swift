@@ -38,7 +38,10 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     // Confined to `queue` like the rest of the recorder's state.
     private final class Segment: @unchecked Sendable {
         let index: Int
+        /// The `.partial` file in `stagingDirectory` being written.
         let url: URL
+        /// Where the finished chunk is moved to.
+        let outputDirectory: URL
         let writer: AVAssetWriter
         let videoInput: AVAssetWriterInput
         let audioInput: AVAssetWriterInput?
@@ -58,12 +61,13 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         /// audio runs ~0.5 s ahead of video, so a new chunk's opening audio
         /// always has to wait here.
         var pendingAudio: [CMSampleBuffer] = []
-        /// Frames the camera or encoder dropped while this chunk was current.
-        var droppedFrames = 0
+        /// Frames the camera or encoder dropped in this chunk's time range.
+        var drops = FrameDrops()
 
-        init(_ prepared: PreparedWriter, startTime: CMTime) {
-            self.index = prepared.index
+        init(_ prepared: PreparedWriter, index: Int, startTime: CMTime, outputDirectory: URL) {
+            self.index = index
             self.url = prepared.url
+            self.outputDirectory = outputDirectory
             self.writer = prepared.writer
             self.videoInput = prepared.videoInput
             self.audioInput = prepared.audioInput
@@ -73,23 +77,83 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Why and when a chunk lost frames, so the log shows which part of the
+    /// pipeline lost them and whether they cluster at the cut.
+    private struct FrameDrops {
+        enum Reason: String {
+            /// `queue` was still busy when the camera had the next frame.
+            case late
+            /// The camera's buffers were all held downstream (the encoder
+            /// falling behind).
+            case outOfBuffers
+            /// The camera itself skipped, e.g. while reconfiguring.
+            case discontinuity
+            /// The frame arrived, but the writer's encoder wasn't ready.
+            case writerBusy
+            case unknown
+
+            init(cameraReason: String?) {
+                if cameraReason == kCMSampleBufferDroppedFrameReason_FrameWasLate as String {
+                    self = .late
+                } else if cameraReason == kCMSampleBufferDroppedFrameReason_OutOfBuffers as String {
+                    self = .outOfBuffers
+                } else if cameraReason == kCMSampleBufferDroppedFrameReason_Discontinuity as String {
+                    self = .discontinuity
+                } else {
+                    self = .unknown
+                }
+            }
+        }
+
+        // Drops are rare; past this many, only the count grows.
+        private static let maxRecorded = 20
+        private(set) var count = 0
+        /// Each drop's reason and its time from the chunk's start.
+        private var recorded: [(reason: Reason, offset: Double)] = []
+
+        var isEmpty: Bool { count == 0 }
+
+        mutating func add(_ reason: Reason, offset: Double) {
+            count += 1
+            if recorded.count < Self.maxRecorded {
+                recorded.append((reason, offset))
+            }
+        }
+
+        var summary: String {
+            let list = recorded
+                .map { "\($0.reason.rawValue) at \(String(format: "%.2f", $0.offset)) s" }
+                .joined(separator: ", ")
+            let more = count > recorded.count ? " (+\(count - recorded.count) more)" : ""
+            return "\(count) frames dropped: \(list)\(more)"
+        }
+    }
+
     /// A writer that has started writing but not its session, ready to take
-    /// the next chunk's first frame.
+    /// the next chunk's first frame. It isn't tied to a chunk or a recording:
+    /// it writes into `stagingDirectory`, so one can be ready before the
+    /// record button is pressed.
     private final class PreparedWriter: @unchecked Sendable {
-        let index: Int
         let url: URL
         let writer: AVAssetWriter
         let videoInput: AVAssetWriterInput
         let audioInput: AVAssetWriterInput?
         let dimensions: CMVideoDimensions
+        /// The `settingsGeneration` it was built with.
+        let settingsGeneration: Int
 
-        init(index: Int, url: URL, writer: AVAssetWriter, videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput?, dimensions: CMVideoDimensions) {
-            self.index = index
+        init(url: URL, writer: AVAssetWriter, videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput?, dimensions: CMVideoDimensions, settingsGeneration: Int) {
             self.url = url
             self.writer = writer
             self.videoInput = videoInput
             self.audioInput = audioInput
             self.dimensions = dimensions
+            self.settingsGeneration = settingsGeneration
+        }
+
+        func matches(_ dimensions: CMVideoDimensions, settingsGeneration: Int) -> Bool {
+            self.settingsGeneration == settingsGeneration
+                && self.dimensions.width == dimensions.width && self.dimensions.height == dimensions.height
         }
 
         func discard() {
@@ -123,6 +187,19 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     // drops, so it's written a few buffers per callback instead (catching up
     // in about a quarter of a second).
     private static let audioBuffersPerCallback = 4
+    // After a writer can't be prepared (e.g. the disk is full), wait this
+    // long before trying again rather than retrying on every frame.
+    private static let prepareRetryDelay = CMTime(seconds: 2, preferredTimescale: 600)
+
+    /// Where chunks are written until they're finished, independent of the
+    /// recording, so a writer can be prepared before recording starts.
+    /// Finished chunks are moved to the recording's directory, which is on
+    /// the same volume, so the move is a rename.
+    private static let stagingDirectory: URL = {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Recording", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
 
     /// Builds the next chunk's writer ahead of the cut. Creating a writer and
     /// its encoder takes long enough that doing it on `queue` at the cut makes
@@ -135,8 +212,14 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     private var videoSettings: [String: Any]?
     private var audioSettings: [String: Any]?
     private var prepared: PreparedWriter?
-    /// Bumped on every start and stop, so a writer prepared for an earlier
-    /// recording is thrown away instead of used.
+    private var isPreparing = false
+    /// Host time before which a failed preparation isn't retried.
+    private var nextPrepareAttempt: CMTime = .zero
+    /// Bumped on every settings change, so a writer built with older
+    /// settings is replaced instead of used.
+    private var settingsGeneration = 0
+    /// Bumped on every start and stop, so a stop timer from an earlier
+    /// recording does nothing.
     private var generation = 0
 
     private var isActive = false
@@ -151,9 +234,6 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     private var draining: Segment?
     private var cutRequested = false
     private var previousVideoTime: CMTime = .invalid
-    /// Frame size seen most recently, recording or not, so the first
-    /// chunk's writer can be prepared before its first frame arrives.
-    private var latestDimensions: CMVideoDimensions?
     /// The longest any video frame has taken to reach us after capture.
     /// The delay dips briefly when the camera drops frames to catch up; the
     /// audio history must not shrink with it, or the next chunk's opening
@@ -183,10 +263,25 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         queue.async {
             self.videoSettings = video
             self.audioSettings = audio
-            // A writer prepared with the old settings would no longer match.
-            self.discardPrepared()
-            self.prepareNextWriter()
+            self.settingsGeneration += 1
+            // While recording, the stale prepared writer is left until the
+            // next cut replaces it. A camera flip lands here while the old
+            // camera's last ~1.6 s of frames are still being encoded, and
+            // tearing down one encoder and starting another then stalls the
+            // current one (~0.7 s of frames lost on an iPhone 17). When idle,
+            // the next frame prepares a matching writer.
+            if !self.isActive {
+                self.discardPrepared()
+            }
         }
+    }
+
+    /// Throws away the prepared writer. Call when the capture session is
+    /// interrupted: in the background the app loses the hardware encoder,
+    /// and a writer that sat through that may fail on its first frame.
+    /// A new one is prepared when frames resume.
+    func discardPreparedWriter() {
+        queue.async { self.discardPrepared() }
     }
 
     func start(outputDirectory: URL, chunkDuration: TimeInterval) {
@@ -201,7 +296,6 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             self.isStopping = false
             self.generation += 1
             self.isActive = true
-            self.prepareNextWriter()
         }
     }
 
@@ -240,7 +334,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         isActive = false
         isStopping = true
         generation += 1
-        discardPrepared()
+        // The prepared writer is kept for the next recording.
         if let draining {
             self.draining = nil
             finish(draining)
@@ -261,14 +355,22 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             width: Int32(CVPixelBufferGetWidth(pixelBuffer)),
             height: Int32(CVPixelBufferGetHeight(pixelBuffer))
         )
-        latestDimensions = dimensions
         let time = sampleBuffer.presentationTimeStamp
         // Capture timestamps are on the host clock.
         let delay = CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), time)
         if delay > videoDelay, delay < Self.maximumAudioHistory {
             videoDelay = delay
         }
-        guard isActive else { return }
+        guard isActive else {
+            // Keep a writer ready for the record button, matching the camera
+            // and settings in use now. Otherwise the first chunk builds one
+            // on its first frame, and the camera drops ~0.5 s meanwhile.
+            if let prepared, !prepared.matches(dimensions, settingsGeneration: settingsGeneration) {
+                discardPrepared()
+            }
+            prepareNextWriter(dimensions: dimensions)
+            return
+        }
         if let stopTime, time >= stopTime {
             finishStopping()
             return
@@ -290,7 +392,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         guard let segment = current else { return }
 
         if !segment.videoInput.isReadyForMoreMediaData {
-            segment.droppedFrames += 1
+            segment.drops.add(.writerBusy, offset: CMTimeSubtract(time, segment.startTime).seconds)
         } else if !segment.videoInput.append(sampleBuffer) {
             fail(segment)
             return
@@ -379,17 +481,20 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     private func startSegment(at time: CMTime, dimensions: CMVideoDimensions) -> Bool {
         let index = nextChunkIndex
         let ready: PreparedWriter
+        let directory: URL
         do {
-            if let prepared, prepared.index == index,
-               prepared.dimensions.width == dimensions.width, prepared.dimensions.height == dimensions.height {
+            guard let outputDirectory else { throw RecorderError.cannotStart }
+            directory = outputDirectory
+            if let prepared, prepared.matches(dimensions, settingsGeneration: settingsGeneration),
+               prepared.writer.status == .writing {
                 ready = prepared
                 self.prepared = nil
             } else {
-                // A size change, or the preparation hadn't finished: build
-                // it here, at the cost of a frame or two.
+                // A size or settings change, or the preparation hadn't
+                // finished: build it here, at the cost of a frame or two.
                 discardPrepared()
-                guard let directory = outputDirectory, let videoSettings else { throw RecorderError.cannotStart }
-                ready = try Self.makeWriter(index: index, directory: directory, dimensions: dimensions, videoSettings: videoSettings, audioSettings: audioSettings)
+                guard let videoSettings else { throw RecorderError.cannotStart }
+                ready = try Self.makeWriter(dimensions: dimensions, videoSettings: videoSettings, audioSettings: audioSettings, settingsGeneration: settingsGeneration)
             }
         } catch {
             isActive = false
@@ -399,48 +504,59 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         }
 
         ready.writer.startSession(atSourceTime: time)
-        let segment = Segment(ready, startTime: time)
+        let segment = Segment(ready, index: index, startTime: time, outputDirectory: directory)
         current = segment
         nextChunkIndex += 1
         for buffer in recentAudio {
             append(audio: buffer, to: segment)
         }
         DispatchQueue.main.async { self.onChunkStarted?(index) }
-        prepareNextWriter()
+        prepareNextWriter(dimensions: dimensions)
         return true
     }
 
-    /// Builds the writer for the next chunk to start on
-    /// `prepareQueue`. If it isn't ready by the cut, the cut builds its own.
-    private func prepareNextWriter() {
-        guard isActive, prepared == nil, let directory = outputDirectory, let videoSettings,
-              let dimensions = current?.dimensions ?? latestDimensions else { return }
-        let index = nextChunkIndex
-        let generation = generation
+    /// Builds the writer for the next chunk to start on `prepareQueue`. If
+    /// it isn't ready by the cut, the cut builds its own.
+    private func prepareNextWriter(dimensions: CMVideoDimensions) {
+        guard prepared == nil, !isPreparing, let videoSettings,
+              CMClockGetTime(CMClockGetHostTimeClock()) >= nextPrepareAttempt else { return }
+        isPreparing = true
+        let settingsGeneration = settingsGeneration
         nonisolated(unsafe) let video = videoSettings
         nonisolated(unsafe) let audio = audioSettings
         prepareQueue.async {
-            guard let writer = try? Self.makeWriter(index: index, directory: directory, dimensions: dimensions, videoSettings: video, audioSettings: audio) else { return }
+            let writer = try? Self.makeWriter(dimensions: dimensions, videoSettings: video, audioSettings: audio, settingsGeneration: settingsGeneration)
             self.queue.async {
-                if self.isActive, self.generation == generation, self.nextChunkIndex == index, self.prepared == nil {
+                self.isPreparing = false
+                guard let writer else {
+                    self.nextPrepareAttempt = CMTimeAdd(CMClockGetTime(CMClockGetHostTimeClock()), Self.prepareRetryDelay)
+                    return
+                }
+                if self.prepared == nil, writer.settingsGeneration == self.settingsGeneration {
                     self.prepared = writer
                 } else {
-                    writer.discard()
+                    self.discard(writer)
                 }
             }
         }
     }
 
     private func discardPrepared() {
-        prepared?.discard()
+        if let prepared { discard(prepared) }
         prepared = nil
     }
 
-    private static func makeWriter(index: Int, directory: URL, dimensions: CMVideoDimensions, videoSettings: [String: Any], audioSettings: [String: Any]?) throws -> PreparedWriter {
-        // Each writer gets its own file, renamed to chunk_N.mp4 only once
-        // it's finished. A writer prepared for a chunk that ended up being
-        // built at the cut instead must not touch that chunk's file.
-        let url = directory.appendingPathComponent("chunk_\(index)-\(UUID().uuidString).partial")
+    /// Tearing down a writer's encoder can block long enough to drop a
+    /// frame, so it's done on `finishQueue`. A prepared writer has no
+    /// session and nothing appends to it, so that's safe.
+    private func discard(_ writer: PreparedWriter) {
+        finishQueue.async { writer.discard() }
+    }
+
+    private static func makeWriter(dimensions: CMVideoDimensions, videoSettings: [String: Any], audioSettings: [String: Any]?, settingsGeneration: Int) throws -> PreparedWriter {
+        // Each writer gets its own file, moved to the recording's directory
+        // as chunk_N.mp4 only once it's finished.
+        let url = stagingDirectory.appendingPathComponent("\(UUID().uuidString).partial")
 
         // The recommended settings don't account for the connection's
         // rotation; the frames themselves have the right size.
@@ -471,7 +587,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             }
 
             guard writer.startWriting() else { throw writer.error ?? RecorderError.cannotStart }
-            return PreparedWriter(index: index, url: url, writer: writer, videoInput: videoInput, audioInput: audioInput, dimensions: dimensions)
+            return PreparedWriter(url: url, writer: writer, videoInput: videoInput, audioInput: audioInput, dimensions: dimensions, settingsGeneration: settingsGeneration)
         } catch {
             try? FileManager.default.removeItem(at: url)
             throw error
@@ -499,8 +615,8 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     private func finish(_ segment: Segment) {
         let end = segment.endTime ?? segment.lastVideoEnd
         let duration = max(CMTimeSubtract(end, segment.startTime).seconds, 0.01)
-        if segment.droppedFrames > 0 {
-            print("⚠️ Chunk \(segment.index + 1): \(segment.droppedFrames) frames dropped")
+        if !segment.drops.isEmpty {
+            print("⚠️ Chunk \(segment.index + 1) (\(String(format: "%.2f", duration)) s): \(segment.drops.summary)")
         }
         finishingCount += 1
         // The segment is no longer current or draining, so nothing on
@@ -529,7 +645,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             self.queue.async {
                 self.finishingCount -= 1
                 let result: RecordedChunk
-                let finalURL = segment.url.deletingLastPathComponent().appendingPathComponent("chunk_\(segment.index).mp4")
+                let finalURL = segment.outputDirectory.appendingPathComponent("chunk_\(segment.index).mp4")
                 do {
                     guard segment.writer.status == .completed else {
                         throw segment.writer.error ?? RecorderError.cannotFinish
@@ -601,7 +717,22 @@ nonisolated extension ChunkRecorder: AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        // The camera discarded a frame because `queue` was still busy.
-        current?.droppedFrames += 1
+        let reason = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil) as? String
+        recordDrop(FrameDrops.Reason(cameraReason: reason), at: sampleBuffer.presentationTimeStamp)
+    }
+
+    /// Charges a frame the camera dropped to the chunk it belongs to: the
+    /// chunk still waiting on audio if it's from before that cut, otherwise
+    /// the current one (a negative offset means just before its first frame).
+    private func recordDrop(_ reason: FrameDrops.Reason, at time: CMTime) {
+        let segment: Segment?
+        if let draining, let end = draining.endTime, time.isValid, time < end {
+            segment = draining
+        } else {
+            segment = current
+        }
+        guard let segment else { return }
+        let offset = time.isValid ? CMTimeSubtract(time, segment.startTime).seconds : .nan
+        segment.drops.add(reason, offset: offset)
     }
 }
