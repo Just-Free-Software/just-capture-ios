@@ -55,12 +55,12 @@ struct ContentView: View {
                 
                 DashboardView()
                     .tabItem {
-                        Label("Recordings", systemImage: "square.stack.fill")
+                        Label("My Clips", systemImage: "square.stack.fill")
                     }
 
                 SharedView()
                     .tabItem {
-                        Label("Shared", systemImage: "person.2.fill")
+                        Label("Watch", systemImage: "play.rectangle.fill")
                     }
 
                 SettingsView()

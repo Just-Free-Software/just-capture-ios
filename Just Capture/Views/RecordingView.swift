@@ -15,8 +15,12 @@ struct RecordingView: View {
     @AppStorage("emailRecipients") private var emailRecipients: String = ""
     @AppStorage("chunkDuration") private var chunkDuration: Double = 30
     @State private var showLowStorageConfirm = false
+    @State private var deviceFreeBytes: Int64?
     @State private var showOutOfStorageAlert = false
     @State private var storageEmailSentForSessionId: String?
+    @AppStorage("hideSendClipTip") private var hideSendClipTip = false
+    @State private var sendClipTipDismissed = false
+    @State private var sendClipTipDontShowAgain = false
     
     private var recipientCount: Int {
         guard emailAlertsEnabled else { return 0 }
@@ -71,6 +75,15 @@ struct RecordingView: View {
             .animation(.snappy, value: cameraManager.isRecording)
             .animation(.snappy, value: cameraManager.recordingError)
             .animation(.snappy, value: uploadManager.storageExceeded)
+            .animation(.snappy, value: isDeviceStorageLow)
+        }
+        .task {
+            // Local filesystem query only (no network), re-checked so the
+            // warning appears if the phone fills up mid-recording.
+            while !Task.isCancelled {
+                deviceFreeBytes = DeviceStorage.availableBytes()
+                try? await Task.sleep(for: .seconds(30))
+            }
         }
         .onAppear {
             cameraManager.setupSession()
@@ -128,13 +141,16 @@ struct RecordingView: View {
                     color: recipientCount > 0 ? .white : Theme.warning
                 )
                 readinessPill(systemImage: "externaldrive.fill", text: driveStorageText, color: driveStorageColor)
+                if isDeviceStorageLow {
+                    readinessPill(systemImage: "iphone.gen3", text: "iPhone low", color: Theme.warning)
+                }
                 readinessPill(
                     systemImage: locationAuthorized ? "location.fill" : "location.slash.fill",
                     text: locationAuthorized ? "Location" : "No location",
-                    color: locationAuthorized ? .white : Theme.warning
+                    color: locationAuthorized ? .white : Theme.record
                 )
-                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity)
             .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
@@ -163,12 +179,17 @@ struct RecordingView: View {
     
     private var driveStorageText: String {
         switch driveStorageManager.state {
-        case .ok: return driveStorageManager.availableBytes.map { "\(DriveStorageManager.formatBytes($0)) free" } ?? "Drive"
+        case .ok: return driveStorageManager.availableBytes.map { DriveStorageManager.formatBytes($0) } ?? "Drive"
         case .low: return "Drive low"
         case .out: return "Drive full"
         case .unlimited: return "Unlimited"
         case .unavailable: return "Drive"
         }
+    }
+    
+    private var isDeviceStorageLow: Bool {
+        guard let deviceFreeBytes else { return false }
+        return DeviceStorage.isLow(availableBytes: deviceFreeBytes, bytesPerSecond: driveStorageManager.bytesPerSecondEstimate)
     }
     
     private var driveStorageColor: Color {
@@ -199,6 +220,18 @@ struct RecordingView: View {
                 systemImage: "externaldrive.badge.exclamationmark",
                 title: "Google Drive is full",
                 message: "Clips are kept on this phone and will upload automatically once you free up space."
+            )
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+        if isDeviceStorageLow, let free = deviceFreeBytes {
+            let minutes = DriveStorageManager.formatRecordingTime(
+                DeviceStorage.recordingSeconds(availableBytes: free, bytesPerSecond: driveStorageManager.bytesPerSecondEstimate)
+            )
+            NoticeBanner(
+                style: .warning,
+                systemImage: "iphone.gen3.badge.exclamationmark",
+                title: "iPhone storage is low",
+                message: "\(DriveStorageManager.formatBytes(free)) free, about \(minutes) of recording. Clips are kept on this phone, so delete old sessions in My Clips to free up space."
             )
             .transition(.move(edge: .top).combined(with: .opacity))
         }
@@ -257,15 +290,6 @@ struct RecordingView: View {
                     if let job = liveEmailJob {
                         emailStatusLine(job)
                     }
-                    Button {
-                        cameraManager.cutChunkNow()
-                    } label: {
-                        Label("Send clip now", systemImage: "paperplane.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .padding(.horizontal, 6)
-                    }
-                    .buttonStyle(.glass)
-                    .accessibilityHint("Ends clip \(cameraManager.currentChunkIndex + 1) early and uploads it")
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
@@ -283,6 +307,31 @@ struct RecordingView: View {
                 )
                 .disabled(cameraManager.isUsingFrontCamera || cameraManager.permissionDenied)
                 .opacity(cameraManager.isUsingFrontCamera ? 0.4 : 1)
+                // Floats above the torch without changing the row's layout.
+                .overlay(alignment: .top) {
+                    circleControl(
+                        systemImage: "paperplane.fill",
+                        tint: .white,
+                        label: "Send clip now",
+                        action: cameraManager.cutChunkNow
+                    )
+                    .disabled(!cameraManager.isRecording)
+                    .opacity(cameraManager.isRecording ? 1 : 0.4)
+                    .accessibilityHint(cameraManager.isRecording
+                        ? "Ends clip \(cameraManager.currentChunkIndex + 1) early and uploads it"
+                        : "Available while recording")
+                    // Outside the disabled/opacity modifiers so the tip stays
+                    // fully visible and tappable when not recording.
+                    .overlay(alignment: .bottomLeading) {
+                        if showSendClipTip {
+                            sendClipTip
+                                .fixedSize()
+                                .offset(y: -(54 + 6))
+                                .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .bottomLeading)))
+                        }
+                    }
+                    .offset(y: -(54 + 14))
+                }
                 
                 Spacer()
                 recordButton
@@ -299,6 +348,65 @@ struct RecordingView: View {
             .padding(.horizontal, 24)
         }
         .padding(.bottom, 20)
+    }
+    
+    // MARK: - Send clip tip
+    
+    private var showSendClipTip: Bool {
+        !hideSendClipTip && !sendClipTipDismissed && !cameraManager.permissionDenied
+    }
+    
+    private var sendClipTip: some View {
+        let background = Color.black.opacity(0.8)
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Send clip now")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer(minLength: 8)
+                    Button(action: dismissSendClipTip) {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Theme.secondaryText)
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Close tip")
+                }
+                Text("While recording, tap this to end the current clip early and upload it right away, instead of waiting for the \(Int(chunkDuration))-second clip to finish.")
+                    .font(.caption)
+                    .foregroundStyle(Theme.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    sendClipTipDontShowAgain.toggle()
+                } label: {
+                    Label("Don't show again", systemImage: sendClipTipDontShowAgain ? "checkmark.square.fill" : "square")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(sendClipTipDontShowAgain ? Theme.accent : .white)
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(sendClipTipDontShowAgain ? .isSelected : [])
+            }
+            .padding(12)
+            .frame(width: 240, alignment: .leading)
+            .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            
+            // Points down at the center of the 54pt send button.
+            TipArrow()
+                .fill(background)
+                .frame(width: 16, height: 8)
+                .padding(.leading, 27 - 8)
+        }
+        .foregroundStyle(.white)
+    }
+    
+    private func dismissSendClipTip() {
+        if sendClipTipDontShowAgain {
+            hideSendClipTip = true
+        }
+        withAnimation(.snappy) {
+            sendClipTipDismissed = true
+        }
     }
     
     private func emailStatusLine(_ job: EmailJob) -> some View {
@@ -401,7 +509,7 @@ struct RecordingView: View {
         enqueueEmail(
             for: session,
             subject: "Storage Full: \(settings.subject)",
-            note: settings.storageFullNote,
+            note: EmailSettings.storageFullNote,
             settings: settings
         )
     }
@@ -456,5 +564,17 @@ struct RecordingView: View {
             includeLocation: settings.includeLocation,
             authManager: authManager
         )
+    }
+}
+
+/// Downward-pointing triangle under the send clip tip.
+private struct TipArrow: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+        path.closeSubpath()
+        return path
     }
 }

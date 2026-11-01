@@ -372,14 +372,6 @@ enum GoogleDriveService {
         return files
     }
 
-    /// Session folders this app has created, newest first.
-    static func listSessionFolders(accessToken: String) async throws -> [DriveFile] {
-        try await listFiles(
-            query: "mimeType = 'application/vnd.google-apps.folder' and name contains 'Session ' and trashed = false",
-            access: .user(accessToken: accessToken)
-        )
-    }
-
     static func listFiles(inFolder folderId: String, access: ReadAccess) async throws -> [DriveFile] {
         try await listFiles(query: "'\(folderId)' in parents and trashed = false", access: access)
     }

@@ -8,26 +8,24 @@ struct EmailSettings {
     static let nameToken = "[your_name]"
     /// Subject used by early builds; treated as "not customised".
     static let legacySubject = "🚨 Emergency Recording Alert"
-    static let defaultStorageFullNote = "Google Drive storage is full, so new clips cannot be uploaded right now. Recording is still in progress and the app will keep retrying — clips will upload automatically as soon as storage is freed."
+    /// Note for the second email, sent if Drive fills up mid-recording.
+    static let storageFullNote = "Google Drive storage is full, so new clips cannot be uploaded right now. Recording is still in progress and the app will keep retrying — clips will upload automatically as soon as storage is freed."
 
     var alertsEnabled: Bool
     var recipients: [String]
     var subject: String
     var note: String
-    var storageFullNote: String
     var includeTime: Bool
     var includeLocation: Bool
 
     static var current: EmailSettings {
         let defaults = UserDefaults.standard
         let rawSubject = defaults.string(forKey: "emailSubject")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let storageNote = defaults.string(forKey: "storageFullEmailNote")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return EmailSettings(
             alertsEnabled: (defaults.object(forKey: "emailAlertsEnabled") as? Bool) ?? true,
             recipients: parseRecipients(defaults.string(forKey: "emailRecipients") ?? ""),
             subject: (rawSubject.isEmpty || rawSubject == legacySubject) ? defaultSubject : rawSubject,
             note: defaults.string(forKey: "emailNote")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
-            storageFullNote: storageNote.isEmpty ? defaultStorageFullNote : storageNote,
             includeTime: (defaults.object(forKey: "includeTimeInEmail") as? Bool) ?? true,
             includeLocation: (defaults.object(forKey: "includeLocationInEmail") as? Bool) ?? true
         )

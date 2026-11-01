@@ -35,12 +35,6 @@ class UploadQueueManager {
     private var activeUploads = 0
     private var slotWaiters: [CheckedContinuation<Void, Never>] = []
     
-    /// Mirrors the "Save Chunks Locally" setting in UserDefaults. Defaults to true
-    /// (preserve files after upload) when the key has never been written.
-    private static var saveChunksLocally: Bool {
-        (UserDefaults.standard.object(forKey: "saveChunksLocally") as? Bool) ?? true
-    }
-    
     /// Backoff for re-checking Drive after the quota is exhausted. The first
     /// re-check happens after a few minutes, then the interval doubles up to
     /// a cap, since freeing space typically requires the user to act. Checks
@@ -210,10 +204,6 @@ class UploadQueueManager {
                     storageExceeded = false
                     sessionStore?.save()
                     onChunkUploaded?(chunk)
-                    
-                    if !Self.saveChunksLocally {
-                        try? FileManager.default.removeItem(at: chunk.localURL)
-                    }
                     
                     uploadTasks.removeValue(forKey: chunk.id)
                     await updatePlaylist(session: session, authManager: authManager)

@@ -56,6 +56,9 @@ enum GmailService {
         print("✅ Email sent successfully to \(recipients.joined(separator: ", "))!")
     }
     
+    // TODO: Replace with the real App Store link once the app is listed.
+    private static let appDownloadURL = "https://example.com/just-capture"
+    
     private static func escapeHTML(_ text: String) -> String {
         text.replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
@@ -76,7 +79,7 @@ enum GmailService {
             timestampFormatter.dateFormat = "MMM d, yyyy 'at' h:mm a zzz"
             timestampFormatter.timeZone = .current
             let timeString = timestampFormatter.string(from: startedAt)
-            let timeHtml = "<p style=\"color: #cccccc; font-size: 14px; margin-bottom: 20px;\"><strong>Recording Started:</strong> \(timeString)</p>"
+            let timeHtml = "<p>Recording started: \(timeString)</p>"
             template = template.replacingOccurrences(of: "{{TIMESTAMP_SECTION}}", with: timeHtml)
             template = template.replacingOccurrences(of: "{{TIMESTAMP}}", with: timeString)
         } else {
@@ -85,48 +88,35 @@ enum GmailService {
         }
         
         if let address = address, !address.isEmpty {
-            let addressHtml = "<p style=\"color: #e0e0e0; font-size: 14px; margin: 10px 0;\">📍 <strong>Location:</strong> \(escapeHTML(address))</p>"
+            let addressHtml = "<p>Location: \(escapeHTML(address))</p>"
             template = template.replacingOccurrences(of: "{{ADDRESS_SECTION}}", with: addressHtml)
         } else {
             template = template.replacingOccurrences(of: "{{ADDRESS_SECTION}}", with: "")
         }
         
         if let lat = latitude, let lng = longitude {
-            let mapHtml = """
-            <p style="margin: 10px 0;">
-                <a href="https://www.google.com/maps?q=\(lat),\(lng)" style="color: #4da6ff; text-decoration: none; font-weight: 500;">
-                    📍 View location on Google Maps →
-                </a>
-            </p>
-            """
+            let mapHtml = "<p><a href=\"https://www.google.com/maps?q=\(lat),\(lng)\">View location on Google Maps</a></p>"
             template = template.replacingOccurrences(of: "{{MAP_LINK_SECTION}}", with: mapHtml)
         } else {
             template = template.replacingOccurrences(of: "{{MAP_LINK_SECTION}}", with: "")
         }
         
         if let link = driveFolderLink, !link.isEmpty {
-            let driveHtml = """
-            <p style="margin: 20px 0;">
-                <a href="\(escapeHTML(link))" style="display: inline-block; padding: 12px 24px; background-color: #007bff; color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 14px;">
-                    View Live Recording on Google Drive
-                </a>
-            </p>
-            """
+            let driveHtml = "<p><a href=\"\(escapeHTML(link))\">View the live recording on Google Drive</a></p>"
             template = template.replacingOccurrences(of: "{{DRIVE_LINK_SECTION}}", with: driveHtml)
         } else {
             template = template.replacingOccurrences(of: "{{DRIVE_LINK_SECTION}}", with: "")
         }
         
         if !bodyNote.isEmpty {
-            let noteHtml = """
-            <p style="background-color: #2a2a2a; border-left: 4px solid #ff4444; padding: 12px; border-radius: 4px; color: #e0e0e0; font-size: 14px; margin: 15px 0;">
-                📝 <strong>Note:</strong> \(escapeHTML(bodyNote))
-            </p>
-            """
+            let noteHtml = "<p>Note: \(escapeHTML(bodyNote))</p>"
             template = template.replacingOccurrences(of: "{{NOTE_SECTION}}", with: noteHtml)
         } else {
             template = template.replacingOccurrences(of: "{{NOTE_SECTION}}", with: "")
         }
+        
+        let appHtml = "<p style=\"color: #888888; font-size: 12px;\">For a better viewing experience, <a href=\"\(escapeHTML(appDownloadURL))\">download Just Capture</a>.</p>"
+        template = template.replacingOccurrences(of: "{{APP_LINK_SECTION}}", with: appHtml)
         
         return template
     }
@@ -141,14 +131,14 @@ enum GmailService {
         return """
         <!DOCTYPE html>
         <html>
-        <body style="background-color: #121212; color: #ffffff; font-family: sans-serif; padding: 20px;">
-            <h2 style="color: #ff4444;">I am broadcasting</h2>
+        <body style="font-family: sans-serif; font-size: 14px;">
+            <p><strong>{{SUBJECT}}</strong></p>
             {{TIMESTAMP_SECTION}}
             {{ADDRESS_SECTION}}
             {{MAP_LINK_SECTION}}
             {{DRIVE_LINK_SECTION}}
             {{NOTE_SECTION}}
-            <br/><p style="color: #888888; font-size: 12px;">Sent via Just App 2</p>
+            {{APP_LINK_SECTION}}
         </body>
         </html>
         """
