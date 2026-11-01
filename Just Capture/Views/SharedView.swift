@@ -84,7 +84,7 @@ struct SharedView: View {
             // checked in the last 30 seconds.
             .refreshable { await store.checkForNewClips(minimumInterval: 30) }
             .background(Theme.background.ignoresSafeArea())
-            .navigationTitle("Shared")
+            .navigationTitle("Watch")
             .task { await store.checkForNewClips(minimumInterval: 5 * 60) }
             .sheet(item: $playing) { target in
                 DrivePlaybackView(folderId: target.id, source: .publicLink, title: target.title)

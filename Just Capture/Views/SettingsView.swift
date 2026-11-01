@@ -9,19 +9,18 @@ struct SettingsView: View {
     @AppStorage("emailRecipients") private var emailRecipients: String = ""
     @AppStorage("emailSubject") private var emailSubject: String = ""
     @AppStorage("emailNote") private var emailNote: String = ""
-    @AppStorage("storageFullEmailNote") private var storageFullEmailNote: String = ""
     @AppStorage("emailAlertsEnabled") private var emailAlertsEnabled: Bool = true
     @AppStorage("includeTimeInEmail") private var includeTimeInEmail: Bool = true
     @AppStorage("includeLocationInEmail") private var includeLocationInEmail: Bool = true
-    @AppStorage("saveChunksLocally") private var saveChunksLocally: Bool = true
     @FocusState private var focusedField: Field?
 
     @State private var testEmailState: TestEmailState = .idle
     @State private var isRefreshingStorage = false
+    @State private var deviceFreeBytes: Int64?
     @State private var showSignOutConfirm = false
 
     private enum Field: Hashable {
-        case recipients, subject, note, storageNote
+        case recipients, subject, note
     }
 
     private enum TestEmailState: Equatable {
@@ -69,6 +68,7 @@ struct SettingsView: View {
             .tint(Theme.accent)
             .animation(.default, value: emailAlertsEnabled)
             .onAppear {
+                deviceFreeBytes = DeviceStorage.availableBytes()
                 if emailSubject.isEmpty || emailSubject == EmailSettings.legacySubject {
                     emailSubject = EmailSettings.defaultSubject
                 }
@@ -226,9 +226,6 @@ struct SettingsView: View {
                 .focused($focusedField, equals: .note)
             Toggle("Include start time", isOn: $includeTimeInEmail)
             Toggle("Include location", isOn: $includeLocationInEmail)
-            TextField("Message if Drive fills up", text: $storageFullEmailNote, prompt: Text("Default message"), axis: .vertical)
-                .lineLimit(2...5)
-                .focused($focusedField, equals: .storageNote)
         } header: {
             Text("Email Content")
         } footer: {
@@ -250,6 +247,7 @@ struct SettingsView: View {
             }
             Button {
                 isRefreshingStorage = true
+                deviceFreeBytes = DeviceStorage.availableBytes()
                 Task {
                     await driveStorageManager.refresh(authManager: authManager)
                     isRefreshingStorage = false
@@ -262,8 +260,12 @@ struct SettingsView: View {
                 }
             }
             .disabled(isRefreshingStorage)
-
-            Toggle("Keep clips on this phone", isOn: $saveChunksLocally)
+            if let deviceFreeBytes {
+                LabeledContent("This iPhone") {
+                    Text("\(DriveStorageManager.formatBytes(deviceFreeBytes)) free")
+                        .foregroundStyle(isDeviceStorageLow ? Theme.warning : .secondary)
+                }
+            }
         } header: {
             Text("Storage")
         } footer: {
@@ -288,14 +290,20 @@ struct SettingsView: View {
         }
     }
 
+    private var isDeviceStorageLow: Bool {
+        guard let deviceFreeBytes else { return false }
+        return DeviceStorage.isLow(availableBytes: deviceFreeBytes, bytesPerSecond: driveStorageManager.bytesPerSecondEstimate)
+    }
+
     private var storageFooter: String {
         var parts: [String] = []
         if let seconds = driveStorageManager.estimatedRecordingSeconds {
             parts.append("Enough space for about \(DriveStorageManager.formatRecordingTime(seconds)) of recording.")
         }
-        parts.append(saveChunksLocally
-            ? "Clips stay on this phone after uploading."
-            : "Clips are deleted from this phone once they're safely in Drive.")
+        parts.append("Clips stay on this phone after uploading.")
+        if isDeviceStorageLow {
+            parts.append("Your iPhone is running low on space; delete old sessions in My Clips to make room for new recordings.")
+        }
         parts.append("Clips in Google Drive are never deleted by the app.")
         return parts.joined(separator: " ")
     }

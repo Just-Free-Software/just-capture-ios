@@ -6,7 +6,6 @@ struct DashboardView: View {
     @Environment(EmailQueueManager.self) private var emailQueueManager
 
     @State private var sessionToDelete: RecordingSession?
-    @State private var showDriveSessions = false
 
     private var totalDuration: TimeInterval {
         sessionStore.sessions.reduce(0) { $0 + $1.totalDuration }
@@ -65,17 +64,7 @@ struct DashboardView: View {
                 }
             }
             .background(Theme.background.ignoresSafeArea())
-            .navigationTitle("Recordings")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Sessions in Drive", systemImage: "icloud.and.arrow.down") {
-                        showDriveSessions = true
-                    }
-                }
-            }
-            .sheet(isPresented: $showDriveSessions) {
-                DriveSessionsView()
-            }
+            .navigationTitle("My Clips")
             .navigationDestination(for: String.self) { id in
                 if let session = sessionStore.sessions.first(where: { $0.id == id }) {
                     SessionDetailView(session: session)
@@ -256,7 +245,7 @@ struct SessionDetailView: View {
             HStack(spacing: 10) {
                 if let link = session.driveFolderLink, let url = URL(string: link) {
                     Link(destination: url) {
-                        Label("Open in Drive", systemImage: "folder.fill")
+                        Label("Drive", systemImage: "folder.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.glassProminent)
@@ -266,7 +255,7 @@ struct SessionDetailView: View {
                     Button {
                         playingFromDrive = true
                     } label: {
-                        Label("Play from Drive", systemImage: "play.fill")
+                        Label("Play", systemImage: "play.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.glass)
