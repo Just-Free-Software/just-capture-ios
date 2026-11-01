@@ -4,12 +4,17 @@ import Foundation
 /// UserDefaults. Keys and defaults must match the `@AppStorage` declarations
 /// in SettingsView.
 struct EmailSettings {
-    static let defaultSubject = "Alert! [your_name] is broadcasting"
+    static let defaultSubject = "[your_name] started recording"
     static let nameToken = "[your_name]"
-    /// Subject used by early builds; treated as "not customised".
-    static let legacySubject = "🚨 Emergency Recording Alert"
+    /// Defaults from earlier builds. Settings used to save the default into
+    /// storage, so these are treated as "not customised" and replaced.
+    static let legacySubjects: Set<String> = ["🚨 Emergency Recording Alert", "Alert! [your_name] is broadcasting"]
+
+    static func isDefaultSubject(_ subject: String) -> Bool {
+        subject.isEmpty || legacySubjects.contains(subject)
+    }
     /// Note for the second email, sent if Drive fills up mid-recording.
-    static let storageFullNote = "Google Drive storage is full, so new clips cannot be uploaded right now. Recording is still in progress and the app will keep retrying — clips will upload automatically as soon as storage is freed."
+    static let storageFullNote = "Google Drive storage is full, so new clips cannot be uploaded right now. Recording is still in progress and the app will keep retrying — it will try to upload the remaining clips once storage is freed."
 
     var alertsEnabled: Bool
     var recipients: [String]
@@ -24,7 +29,7 @@ struct EmailSettings {
         return EmailSettings(
             alertsEnabled: (defaults.object(forKey: "emailAlertsEnabled") as? Bool) ?? true,
             recipients: parseRecipients(defaults.string(forKey: "emailRecipients") ?? ""),
-            subject: (rawSubject.isEmpty || rawSubject == legacySubject) ? defaultSubject : rawSubject,
+            subject: isDefaultSubject(rawSubject) ? defaultSubject : rawSubject,
             note: defaults.string(forKey: "emailNote")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
             includeTime: (defaults.object(forKey: "includeTimeInEmail") as? Bool) ?? true,
             includeLocation: (defaults.object(forKey: "includeLocationInEmail") as? Bool) ?? true

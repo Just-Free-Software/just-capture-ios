@@ -109,37 +109,45 @@ private struct SignInView: View {
         ZStack {
             Theme.background.ignoresSafeArea()
             
-            // Soft brand glow behind the logo.
+            // Soft orange glow behind the logo, like the icon's.
             Circle()
-                .fill(Theme.brandGradient)
+                .fill(Theme.accent)
                 .frame(width: 360, height: 360)
                 .blur(radius: 120)
-                .opacity(0.35)
+                .opacity(0.3)
                 .offset(y: -220)
                 .ignoresSafeArea()
             
             VStack(spacing: 0) {
                 Spacer()
                 
-                Image(systemName: "record.circle")
-                    .font(.system(size: 64, weight: .semibold))
-                    .foregroundStyle(Theme.brandGradient)
+                Image("Logo")
+                    .resizable()
+                    .scaledToFit()
                     .frame(width: 112, height: 112)
-                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 26, style: .continuous)
+                            .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                    )
+                    .shadow(color: Theme.accent.opacity(0.35), radius: 24, y: 8)
+                    .accessibilityHidden(true)
                     .padding(.bottom, 24)
                 
-                Text("Just")
-                    .font(.system(size: 52, weight: .bold, design: .rounded))
+                Text("Just Capture")
+                    .font(.system(size: 44, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
-                Text("Record. Back up. Alert.")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .padding(.horizontal, 24)
+                Text("Record. Back up. Notify.")
                     .font(.title3.weight(.medium))
                     .foregroundStyle(Theme.secondaryText)
                     .padding(.top, 4)
                 
                 VStack(alignment: .leading, spacing: 18) {
-                    feature("icloud.and.arrow.up.fill", "Every clip goes to your Google Drive the moment it's recorded.")
+                    feature("icloud.and.arrow.up.fill", "As you record, each clip is uploaded to your Google Drive when you have a connection.")
                     feature("envelope.badge.fill", "The people you choose get an email with a link to watch.")
-                    feature("lock.fill", "Footage lives in your own Drive. Nothing is stored anywhere else.")
                 }
                 .padding(.top, 40)
                 .padding(.horizontal, 36)
@@ -165,7 +173,7 @@ private struct SignInView: View {
                 .disabled(isAuthenticating)
                 .padding(.horizontal, 24)
                 
-                Text("Just asks for permission to save to Drive and send email from your Gmail account.")
+                Text("Just Capture asks for permission to save to Drive and send email from your Gmail account.")
                     .font(.caption)
                     .foregroundStyle(Theme.tertiaryText)
                     .multilineTextAlignment(.center)
