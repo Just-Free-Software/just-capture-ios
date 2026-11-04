@@ -137,7 +137,7 @@ struct RecordingView: View {
             HStack(spacing: 8) {
                 readinessPill(
                     systemImage: recipientCount > 0 ? "envelope.fill" : "envelope.badge.shield.half.filled",
-                    text: recipientCount > 0 ? "\(recipientCount) contact\(recipientCount == 1 ? "" : "s")" : "No alerts",
+                    text: recipientCount > 0 ? "\(recipientCount) contact\(recipientCount == 1 ? "" : "s")" : "No contacts",
                     color: recipientCount > 0 ? .white : Theme.warning
                 )
                 readinessPill(systemImage: "externaldrive.fill", text: driveStorageText, color: driveStorageColor)
@@ -209,7 +209,7 @@ struct RecordingView: View {
                 style: .error,
                 systemImage: "video.slash.fill",
                 title: "Recording stopped",
-                message: "\(error) Clips recorded so far are saved and still uploading.",
+                message: "\(error) Clips recorded so far are saved on this phone, and the app will keep trying to upload them.",
                 onDismiss: { cameraManager.recordingError = nil }
             )
             .transition(.move(edge: .top).combined(with: .opacity))
@@ -219,7 +219,7 @@ struct RecordingView: View {
                 style: .warning,
                 systemImage: "externaldrive.badge.exclamationmark",
                 title: "Google Drive is full",
-                message: "Clips are kept on this phone and will upload automatically once you free up space."
+                message: "Clips are kept on this phone, and the app will try uploading them again once you free up space."
             )
             .transition(.move(edge: .top).combined(with: .opacity))
         }
@@ -240,7 +240,7 @@ struct RecordingView: View {
                 style: .warning,
                 systemImage: "link.badge.plus",
                 title: "Contacts can't open your videos",
-                message: "Your Google account (likely work or school) doesn't allow public links, so alert emails will link to a private folder. Sign in with a personal Google account to fix this."
+                message: "Your Google account (likely work or school) doesn't allow public links, so notification emails will link to a private folder. Sign in with a personal Google account to fix this."
             )
             .transition(.move(edge: .top).combined(with: .opacity))
         }
@@ -249,7 +249,7 @@ struct RecordingView: View {
                 style: .info,
                 systemImage: "location.slash.fill",
                 title: "Location is off",
-                message: "Alert emails won't include where you are.",
+                message: "Notification emails won't include where you are.",
                 actionTitle: "Turn On in Settings",
                 action: openAppSettings
             )
@@ -264,7 +264,7 @@ struct RecordingView: View {
             Text("Camera access needed")
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(.white)
-            Text("Just needs the camera and microphone to record. You can turn them on in Settings.")
+            Text("Just Capture needs the camera and microphone to record. You can turn them on in Settings.")
                 .font(.subheadline)
                 .foregroundStyle(Theme.secondaryText)
                 .multilineTextAlignment(.center)
@@ -293,7 +293,7 @@ struct RecordingView: View {
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
-                Text("Clips upload every \(Int(chunkDuration))s")
+                Text("Recording in \(Int(chunkDuration))-second clips")
                     .font(.footnote.weight(.medium))
                     .foregroundStyle(Theme.secondaryText)
             }
@@ -318,7 +318,7 @@ struct RecordingView: View {
                     .disabled(!cameraManager.isRecording)
                     .opacity(cameraManager.isRecording ? 1 : 0.4)
                     .accessibilityHint(cameraManager.isRecording
-                        ? "Ends clip \(cameraManager.currentChunkIndex + 1) early and uploads it"
+                        ? "Ends clip \(cameraManager.currentChunkIndex + 1) early and starts uploading it"
                         : "Available while recording")
                     // Outside the disabled/opacity modifiers so the tip stays
                     // fully visible and tappable when not recording.
@@ -373,7 +373,7 @@ struct RecordingView: View {
                     }
                     .accessibilityLabel("Close tip")
                 }
-                Text("While recording, tap this to end the current clip early and upload it right away, instead of waiting for the \(Int(chunkDuration))-second clip to finish.")
+                Text("While recording, tap this to end the current clip early and start uploading it right away, instead of waiting for the \(Int(chunkDuration))-second clip to finish.")
                     .font(.caption)
                     .foregroundStyle(Theme.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -412,10 +412,10 @@ struct RecordingView: View {
     private func emailStatusLine(_ job: EmailJob) -> some View {
         let (text, icon, color): (String, String, Color) = {
             switch job.status {
-            case .sent: return ("Alert sent to \(job.recipients.count)", "checkmark.circle.fill", Theme.success)
-            case .sending: return ("Sending alert…", "paperplane.fill", .white)
-            case .pending: return (job.attempts == 0 ? "Alert queued" : "Alert retrying (no connection?)", "clock.fill", Theme.warning)
-            case .failed: return ("Alert failed — retry from Dashboard", "exclamationmark.triangle.fill", Theme.record)
+            case .sent: return ("Notification sent to \(job.recipients.count)", "checkmark.circle.fill", Theme.success)
+            case .sending: return ("Sending notification…", "paperplane.fill", .white)
+            case .pending: return (job.attempts == 0 ? "Notification queued" : "Notification retrying (no connection?)", "clock.fill", Theme.warning)
+            case .failed: return ("Notification failed — retry from My Clips", "exclamationmark.triangle.fill", Theme.record)
             }
         }()
         return Label(text, systemImage: icon)

@@ -26,7 +26,7 @@ struct DashboardView: View {
                     ContentUnavailableView(
                         "No Recordings Yet",
                         systemImage: "video.badge.waveform",
-                        description: Text("Sessions you record show up here, with their upload and alert status.")
+                        description: Text("Sessions you record show up here, with their upload and notification status.")
                     )
                 } else {
                     List {
@@ -290,7 +290,7 @@ private struct EmailOutboxCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Alert emails", systemImage: "envelope.fill")
+            Label("Notification emails", systemImage: "envelope.fill")
                 .font(.headline)
                 .foregroundStyle(.white)
             ForEach(jobs) { job in

@@ -58,7 +58,7 @@ struct SettingsView: View {
                 } header: {
                     Text("About")
                 } footer: {
-                    Text("Just records continuously and backs every clip up to your Google Drive as it goes.")
+                    Text("Just Capture records in short clips and tries to upload each one to your Google Drive as it goes.")
                 }
             }
             .navigationTitle("Settings")
@@ -69,7 +69,7 @@ struct SettingsView: View {
             .animation(.default, value: emailAlertsEnabled)
             .onAppear {
                 deviceFreeBytes = DeviceStorage.availableBytes()
-                if emailSubject.isEmpty || emailSubject == EmailSettings.legacySubject {
+                if EmailSettings.isDefaultSubject(emailSubject) {
                     emailSubject = EmailSettings.defaultSubject
                 }
                 if authManager.isSignedIn {
@@ -85,7 +85,7 @@ struct SettingsView: View {
             .confirmationDialog("Sign out of Google?", isPresented: $showSignOutConfirm, titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) { authManager.signOut() }
             } message: {
-                Text("Recording stops, and uploads and alert emails pause until you sign back in.")
+                Text("Recording stops, and uploads and notification emails pause until you sign back in.")
             }
         }
     }
@@ -126,7 +126,7 @@ struct SettingsView: View {
             Text("Account")
         } footer: {
             if uploadManager.publicSharingBlocked {
-                Label("This account doesn't allow public links, so alert contacts won't be able to open your videos. This is usually a work or school account policy. Sign in with a personal Google account instead.", systemImage: "exclamationmark.triangle.fill")
+                Label("This account doesn't allow public links, so the people you notify won't be able to open your videos. This is usually a work or school account policy. Sign in with a personal Google account instead.", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(Theme.warning)
             }
         }
@@ -152,13 +152,13 @@ struct SettingsView: View {
         } header: {
             Text("Recording")
         } footer: {
-            Text("Each clip uploads as soon as it ends. Shorter clips get footage off your phone sooner; longer clips use less data.")
+            Text("Each clip starts uploading as soon as it ends. Shorter clips get footage off your phone sooner; longer clips use less data.")
         }
     }
 
     private var emailSection: some View {
         Section {
-            Toggle("Email alerts", isOn: $emailAlertsEnabled)
+            Toggle("Email notifications", isOn: $emailAlertsEnabled)
 
             if emailAlertsEnabled {
                 TextField("Recipients", text: $emailRecipients, prompt: Text(verbatim: "name@example.com, …"), axis: .vertical)
@@ -180,7 +180,7 @@ struct SettingsView: View {
                 .disabled(recipients.isEmpty || !invalidRecipients.isEmpty || testEmailState == .sending)
             }
         } header: {
-            Text("Email Alerts")
+            Text("Email Notifications")
         } footer: {
             if emailAlertsEnabled {
                 if !invalidRecipients.isEmpty {
@@ -320,7 +320,7 @@ struct SettingsView: View {
                 try await GmailService.sendEmergencyEmail(
                     to: settings.recipients,
                     subject: "[Test] " + EmailSettings.personalize(settings.subject, name: authManager.userName, email: authManager.userEmail),
-                    bodyNote: "This is a test from Just. A real alert also includes a link to your live recording in Google Drive." + (settings.note.isEmpty ? "" : "\n\n" + settings.note),
+                    bodyNote: "This is a test from Just Capture. A real notification also includes a link to your recording in Google Drive." + (settings.note.isEmpty ? "" : "\n\n" + settings.note),
                     startedAt: settings.includeTime ? Date() : nil,
                     address: nil,
                     latitude: nil,

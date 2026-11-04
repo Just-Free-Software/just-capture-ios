@@ -4,23 +4,26 @@ import SwiftUI
 /// of status colours. Screens should reach for these instead of ad-hoc
 /// opacities so spacing and contrast stay consistent.
 enum Theme {
-    static let background = Color(red: 0.04, green: 0.04, blue: 0.06)
+    /// Warm near-black, matching the app icon's background.
+    static let background = Color(red: 0.07, green: 0.045, blue: 0.03)
     static let surface = Color.white.opacity(0.06)
     static let surfaceRaised = Color.white.opacity(0.10)
     static let stroke = Color.white.opacity(0.08)
     static let secondaryText = Color.white.opacity(0.6)
     static let tertiaryText = Color.white.opacity(0.4)
 
-    static let accent = Color(red: 0.36, green: 0.55, blue: 1.0)
+    /// The icon's camcorder orange.
+    static let accent = Color(red: 1.0, green: 0.53, blue: 0.18)
     static let record = Color(red: 1.0, green: 0.27, blue: 0.27)
     static let success = Color(red: 0.25, green: 0.84, blue: 0.53)
-    static let warning = Color(red: 1.0, green: 0.68, blue: 0.2)
+    /// Yellow rather than amber so warnings stay distinct from the orange accent.
+    static let warning = Color(red: 1.0, green: 0.84, blue: 0.04)
 
     static let cornerRadius: CGFloat = 18
     static let spacing: CGFloat = 16
 
     static let brandGradient = LinearGradient(
-        colors: [Color(red: 1.0, green: 0.35, blue: 0.35), Color(red: 0.62, green: 0.33, blue: 1.0)],
+        colors: [Color(red: 1.0, green: 0.73, blue: 0.41), Color(red: 1.0, green: 0.42, blue: 0.10)],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
