@@ -57,7 +57,7 @@ enum GmailService {
     }
     
     // TODO: Replace with the real App Store link once the app is listed.
-    private static let appDownloadURL = "https://example.com/just-capture"
+    private static let appDownloadURL = "https://justfreesoftware.fyi/just-capture/info"
     
     private static func escapeHTML(_ text: String) -> String {
         text.replacingOccurrences(of: "&", with: "&amp;")

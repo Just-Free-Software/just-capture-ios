@@ -242,6 +242,16 @@ struct SessionDetailView: View {
                     .tint(status.color)
             }
 
+            if let latitude = session.latitude, let longitude = session.longitude,
+               let url = URL(string: "https://www.google.com/maps?q=\(latitude),\(longitude)") {
+                Link(destination: url) {
+                    Label(session.locationAddress ?? String(format: "%.4f, %.4f", latitude, longitude), systemImage: "mappin.and.ellipse")
+                        .font(.subheadline)
+                        .multilineTextAlignment(.leading)
+                }
+                .tint(Theme.accent)
+            }
+
             HStack(spacing: 10) {
                 if let link = session.driveFolderLink, let url = URL(string: link) {
                     Link(destination: url) {

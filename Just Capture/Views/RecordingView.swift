@@ -13,6 +13,7 @@ struct RecordingView: View {
     
     @AppStorage("emailAlertsEnabled") private var emailAlertsEnabled: Bool = true
     @AppStorage("emailRecipients") private var emailRecipients: String = ""
+    @AppStorage("includeLocationInEmail") private var includeLocationInEmail: Bool = true
     @AppStorage("chunkDuration") private var chunkDuration: Double = 30
     @State private var showLowStorageConfirm = false
     @State private var deviceFreeBytes: Int64?
@@ -87,7 +88,9 @@ struct RecordingView: View {
         }
         .onAppear {
             cameraManager.setupSession()
-            locationManager.requestPermission()
+            if includeLocationInEmail {
+                locationManager.requestPermission()
+            }
             Task { await driveStorageManager.refreshIfStale(authManager: authManager) }
         }
         .onChange(of: uploadManager.storageExceeded) { old, exceeded in
@@ -244,12 +247,12 @@ struct RecordingView: View {
             )
             .transition(.move(edge: .top).combined(with: .opacity))
         }
-        if !cameraManager.isRecording && !locationAuthorized && locationManager.authorizationStatus != .notDetermined {
+        if !cameraManager.isRecording && includeLocationInEmail && !locationAuthorized && locationManager.authorizationStatus != .notDetermined {
             NoticeBanner(
                 style: .info,
                 systemImage: "location.slash.fill",
                 title: "Location is off",
-                message: "Notification emails won't include where you are.",
+                message: "Recordings and notification emails won't include where you are.",
                 actionTitle: "Turn On in Settings",
                 action: openAppSettings
             )
@@ -522,14 +525,26 @@ struct RecordingView: View {
             let session = RecordingSession(chunkDuration: duration)
             sessionStore.add(session)
             
+            let savesLocation = includeLocationInEmail
             cameraManager.onChunkCompleted = { chunk in
                 session.chunks.append(chunk)
+                // Saved before the upload below, which also sends the trail to Drive.
+                if savesLocation, EmailSettings.current.includeLocation, locationManager.isAuthorized {
+                    session.addClipToTrail(locationManager.lastKnownFix, clipFileName: chunk.fileName)
+                }
                 sessionStore.save()
                 uploadManager.enqueue(chunk: chunk, session: session, authManager: authManager)
             }
             
-            locationManager.requestLocation()
-            
+            if savesLocation {
+                locationManager.startTracking { location in
+                    session.addStartToTrail(location)
+                    sessionStore.save()
+                    Task { await uploadManager.updateLocationFile(session: session, authManager: authManager) }
+                }
+                Task { await saveLocation(to: session) }
+            }
+
             let outputDir = session.outputDirectory()
             
             cameraManager.startRecording(chunkDuration: duration, outputDirectory: outputDir)
@@ -544,7 +559,31 @@ struct RecordingView: View {
             // but goes out without it rather than stall on a bad network.
             enqueueAlertEmailIfNeeded(for: session)
     }
-    
+
+    /// Records where the session started, whether or not anyone is notified.
+    /// A recent fix is saved right away in case GPS never answers, then replaced
+    /// by one taken after recording started. The rest of the route is the trail.
+    private func saveLocation(to session: RecordingSession) async {
+        let deadline = Date().addingTimeInterval(30)
+        var savedFixDate: Date?
+        while Date() < deadline {
+            if let location = locationManager.freshLocation() {
+                let address = locationManager.address(for: location)
+                if savedFixDate != location.timestamp || (session.locationAddress == nil && address != nil) {
+                    savedFixDate = location.timestamp
+                    session.latitude = location.coordinate.latitude
+                    session.longitude = location.coordinate.longitude
+                    session.locationAddress = address
+                    session.locationDate = location.timestamp
+                    sessionStore.save()
+                    await uploadManager.updateLocationFile(session: session, authManager: authManager)
+                }
+                if location.timestamp >= session.startDate && address != nil { return }
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
     private func enqueueAlertEmailIfNeeded(for session: RecordingSession) {
         let settings = EmailSettings.current
         guard settings.canSend else {
@@ -555,6 +594,7 @@ struct RecordingView: View {
     }
     
     private func enqueueEmail(for session: RecordingSession, subject: String, note: String, settings: EmailSettings) {
+        uploadManager.requestLinkSharing(for: session, authManager: authManager)
         emailQueueManager.enqueue(
             sessionId: session.id,
             recipients: settings.recipients,
