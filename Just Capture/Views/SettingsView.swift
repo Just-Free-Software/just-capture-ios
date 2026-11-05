@@ -230,7 +230,7 @@ struct SettingsView: View {
         } header: {
             Text("Email Content")
         } footer: {
-            Text("\(EmailSettings.nameToken) in the subject is replaced with your name. A second email is sent if your Google Drive runs out of space mid-recording.")
+            Text("A second email is sent if your Google Drive gets close to full while recording. Make sure your contacts can add storage to your account if that happens.")
         }
     }
 
@@ -320,7 +320,7 @@ struct SettingsView: View {
                 let token = try await authManager.validAccessToken()
                 try await GmailService.sendEmergencyEmail(
                     to: settings.recipients,
-                    subject: "[Test] " + EmailSettings.personalize(settings.subject, name: authManager.userName, email: authManager.userEmail),
+                    subject: "[Test] " + EmailSettings.personalize(settings.subject, email: authManager.userEmail),
                     bodyNote: "This is a test from Just Capture. A real notification also includes a link to your recording in Google Drive." + (settings.note.isEmpty ? "" : "\n\n" + settings.note),
                     startedAt: settings.includeTime ? Date() : nil,
                     address: nil,

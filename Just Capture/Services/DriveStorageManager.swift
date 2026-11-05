@@ -13,6 +13,9 @@ final class DriveStorageManager {
     }
     
     static let lowStorageThresholdBytes: Int64 = 250 * 1024 * 1024
+    /// Well above the on-screen warning: clip sizes vary by phone and scene,
+    /// and the email has to go out while the account can still send.
+    static let lowStorageEmailThresholdBytes: Int64 = 1024 * 1024 * 1024
     static let quotaRefreshInterval: TimeInterval = 60
     /// Drive can take a minute or two to count newly uploaded files in the
     /// quota. Within this long of our last upload, a server figure lower than
@@ -39,6 +42,12 @@ final class DriveStorageManager {
     
     var availableBytes: Int64? {
         quota?.availableBytes
+    }
+
+    /// Nearly full but not out; being out is handled by the Storage Full path.
+    var shouldSendLowStorageEmail: Bool {
+        guard !forcedOutOfStorage, let available = availableBytes else { return false }
+        return available > 0 && available < Self.lowStorageEmailThresholdBytes
     }
     
     var bytesPerSecondEstimate: Double {
