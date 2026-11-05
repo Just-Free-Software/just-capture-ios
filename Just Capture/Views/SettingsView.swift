@@ -55,6 +55,8 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Version", value: appVersion)
+                    Link("Website", destination: AppConfig.homepageURL)
+                    Link("Privacy Policy", destination: AppConfig.privacyPolicyURL)
                 } header: {
                     Text("About")
                 } footer: {
