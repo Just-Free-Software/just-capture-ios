@@ -21,6 +21,9 @@ struct EmailSettings {
     var subject: String
     var note: String
     var includeTime: Bool
+    /// The app-wide location switch, not just an email option: when off, the
+    /// app doesn't fetch location for recordings or emails. The storage key
+    /// keeps its older email-specific name so existing choices carry over.
     var includeLocation: Bool
 
     static var current: EmailSettings {

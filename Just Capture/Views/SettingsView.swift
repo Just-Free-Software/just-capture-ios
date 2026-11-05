@@ -149,10 +149,12 @@ struct SettingsView: View {
                 .labelsHidden()
             }
             .padding(.vertical, 4)
+
+            Toggle("Save location", isOn: $includeLocationInEmail)
         } header: {
             Text("Recording")
         } footer: {
-            Text("Each clip starts uploading as soon as it ends. Shorter clips get footage off your phone sooner; longer clips use less data.")
+            Text("Each clip starts uploading as soon as it ends. Shorter clips get footage off your phone sooner; longer clips use less data. Your location is saved when you start recording and at the end of each clip, on this phone and in Google Drive. Where you started is added to notification emails.")
         }
     }
 
@@ -225,7 +227,6 @@ struct SettingsView: View {
                 .lineLimit(2...5)
                 .focused($focusedField, equals: .note)
             Toggle("Include start time", isOn: $includeTimeInEmail)
-            Toggle("Include location", isOn: $includeLocationInEmail)
         } header: {
             Text("Email Content")
         } footer: {

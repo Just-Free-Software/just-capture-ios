@@ -82,7 +82,9 @@ class UploadQueueManager {
             session.driveFolderId = result.folderId
             session.driveFolderLink = result.webViewLink
             self.sessionStore?.save()
-            await self.shareFolder(for: session, authManager: authManager)
+            if session.driveFolderShared == false {
+                await self.shareFolder(for: session, authManager: authManager)
+            }
             // After sharing, so a follow-up link works when it's opened.
             self.onFolderCreated?(session)
             return result.folderId
@@ -90,6 +92,19 @@ class UploadQueueManager {
         folderTasks[session.id] = task
         defer { folderTasks.removeValue(forKey: session.id) }
         return try await task.value
+    }
+
+    /// Marks the session's folder for link sharing because an email is about to
+    /// link to it. Folders stay private until this is called. If the folder
+    /// doesn't exist yet, it's shared when `ensureFolder` creates it.
+    func requestLinkSharing(for session: RecordingSession, authManager: GoogleAuthManager) {
+        guard session.driveFolderShared == nil else { return }
+        session.driveFolderShared = false
+        sessionStore?.save()
+        guard session.driveFolderId != nil else { return }
+        Task { @MainActor in
+            await shareFolder(for: session, authManager: authManager)
+        }
     }
 
     /// Shares the session's folder with anyone who has the link. Best-effort:
@@ -292,15 +307,37 @@ class UploadQueueManager {
             }
         }
         if changed { sessionStore?.save() }
+        // Clips may all be up already, leaving nothing else to retry this.
+        for session in sessions where session.locationText != session.uploadedLocationText {
+            Task { await updateLocationFile(session: session, authManager: authManager) }
+        }
     }
-    
+
     /// Rewrites the session's playlist on Drive. Calls for the same session
     /// run one after another so only one playlist file is ever created.
+    /// Also retries the location file, so a failed upload of it is picked up
+    /// the next time any clip finishes uploading.
     func updatePlaylist(session: RecordingSession, authManager: GoogleAuthManager) async {
+        await runInOrder(for: session) {
+            await self.writePlaylist(session: session, authManager: authManager)
+            await self.writeLocationFile(session: session, authManager: authManager)
+        }
+    }
+
+    /// Uploads the session's location as soon as it's known, without waiting
+    /// for the first clip, in case the phone is lost before that clip uploads.
+    func updateLocationFile(session: RecordingSession, authManager: GoogleAuthManager) async {
+        _ = try? await ensureFolder(for: session, authManager: authManager)
+        await runInOrder(for: session) {
+            await self.writeLocationFile(session: session, authManager: authManager)
+        }
+    }
+
+    private func runInOrder(for session: RecordingSession, _ work: @escaping @MainActor () async -> Void) async {
         let previous = playlistTasks[session.id]
         let task = Task { @MainActor in
             await previous?.value
-            await self.writePlaylist(session: session, authManager: authManager)
+            await work()
         }
         playlistTasks[session.id] = task
         await task.value
@@ -323,6 +360,20 @@ class UploadQueueManager {
         }
     }
     
+    private func writeLocationFile(session: RecordingSession, authManager: GoogleAuthManager) async {
+        guard let content = session.locationText,
+              content != session.uploadedLocationText,
+              let folderId = session.driveFolderId else { return }
+        do {
+            let token = try await authManager.validAccessToken()
+            session.locationFileId = try await GoogleDriveService.uploadOrUpdateTextFile(name: "location.txt", mimeType: "text/plain", content: content, folderId: folderId, existingFileId: session.locationFileId, accessToken: token)
+            session.uploadedLocationText = content
+            sessionStore?.save()
+        } catch {
+            print("Failed to upload location: \(error)")
+        }
+    }
+
     private func generatePlaylistContent(for session: RecordingSession) -> String {
         var m3u8 = """
         #EXTM3U

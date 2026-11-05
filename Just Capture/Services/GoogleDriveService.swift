@@ -230,6 +230,10 @@ enum GoogleDriveService {
     }
     
     static func uploadOrUpdatePlaylist(content: String, folderId: String, existingFileId: String?, accessToken: String) async throws -> String {
+        try await uploadOrUpdateTextFile(name: "playlist.m3u8", mimeType: "application/x-mpegURL", content: content, folderId: folderId, existingFileId: existingFileId, accessToken: accessToken)
+    }
+
+    static func uploadOrUpdateTextFile(name: String, mimeType: String, content: String, folderId: String, existingFileId: String?, accessToken: String) async throws -> String {
         let boundary = "Boundary-\(UUID().uuidString)"
         var request: URLRequest
         
@@ -250,9 +254,9 @@ enum GoogleDriveService {
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
         body.append("Content-Type: application/json; charset=UTF-8\r\n\r\n".data(using: .utf8)!)
         
-        var metadata: [String: Any] = ["mimeType": "application/x-mpegURL"]
+        var metadata: [String: Any] = ["mimeType": mimeType]
         if existingFileId == nil {
-            metadata["name"] = "playlist.m3u8"
+            metadata["name"] = name
             metadata["parents"] = [folderId]
         }
         
@@ -260,7 +264,7 @@ enum GoogleDriveService {
         body.append("\r\n".data(using: .utf8)!)
         
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Type: application/x-mpegURL\r\n\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
         body.append(content.data(using: .utf8)!)
         body.append("\r\n".data(using: .utf8)!)
         body.append("--\(boundary)--".data(using: .utf8)!)

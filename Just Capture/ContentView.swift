@@ -10,6 +10,7 @@ struct ContentView: View {
     @Environment(UploadQueueManager.self) private var uploadManager
     @Environment(SessionStore.self) private var sessionStore
     @Environment(EmailQueueManager.self) private var emailQueueManager
+    @Environment(LocationManager.self) private var locationManager
     @Environment(\.scenePhase) private var scenePhase
     
     @State private var signInError: String?
@@ -23,6 +24,7 @@ struct ContentView: View {
                 // Single place that finalizes a session, whichever path stopped
                 // recording (stop button, backgrounding, sign-out, camera failure).
                 guard wasRecording, !isRecording else { return }
+                locationManager.stopTracking()
                 if let session = sessionStore.currentSession, session.isActive {
                     session.isActive = false
                     sessionStore.save()
