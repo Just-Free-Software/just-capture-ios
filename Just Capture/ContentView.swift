@@ -181,6 +181,11 @@ private struct SignInView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 40)
                     .padding(.top, 14)
+
+                Link("Privacy Policy", destination: AppConfig.privacyPolicyURL)
+                    .font(.caption)
+                    .foregroundStyle(Theme.secondaryText)
+                    .padding(.top, 8)
                     .padding(.bottom, 24)
             }
         }

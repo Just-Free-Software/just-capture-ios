@@ -23,4 +23,7 @@ enum AppConfig {
     static let videoHeight: Int = 1080
     // ~6 Mbps HEVC 1080p; used until real chunk data is available
     static let estimatedVideoBytesPerSecond: Double = 750_000
+
+    static let homepageURL = URL(string: "https://justfreesoftware.fyi/just-capture/info")!
+    static let privacyPolicyURL = URL(string: "https://justfreesoftware.fyi/just-capture/privacy-policy")!
 }
