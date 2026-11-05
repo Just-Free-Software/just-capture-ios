@@ -37,18 +37,44 @@ class UploadQueueManager {
     
     /// Backoff for re-checking Drive after the quota is exhausted. The first
     /// re-check happens after a few minutes, then the interval doubles up to
-    /// a cap, since freeing space typically requires the user to act. Checks
-    /// are cheap (quota endpoint only), so the cap is generous.
+    /// a cap, so clips start uploading soon after someone frees up space.
     static let storageRetryInitialDelay: TimeInterval = 5 * 60
-    static let storageRetryMaxDelay: TimeInterval = 24 * 60 * 60
+    static let storageRetryMaxDelay: TimeInterval = 15 * 60
     static let storageRetryFactor: Double = 2
-    
+    /// Every clip waiting on storage re-checks on its own timer, so they share
+    /// one quota request per this interval. A long backlog would otherwise
+    /// send a request per clip.
+    static let sharedQuotaCheckInterval: TimeInterval = 5 * 60
+    private var lastQuotaCheck: (date: Date, availableBytes: Int64?)?
+    private var quotaCheckTask: Task<Int64?, Error>?
+
     static func storageRetryDelay(forQuotaAttempt attempt: Int) -> TimeInterval {
         var delay = storageRetryInitialDelay
         for _ in 1..<max(1, attempt) { delay = min(storageRetryMaxDelay, delay * storageRetryFactor) }
         return delay
     }
     
+    /// Free Drive space (nil means unlimited), from a recent check if there is
+    /// one. Failed checks aren't remembered, so the caller sees the error.
+    @MainActor
+    private func sharedAvailableBytes(authManager: GoogleAuthManager) async throws -> Int64? {
+        if let last = lastQuotaCheck, Date().timeIntervalSince(last.date) < Self.sharedQuotaCheckInterval {
+            return last.availableBytes
+        }
+        if let quotaCheckTask {
+            return try await quotaCheckTask.value
+        }
+        let task = Task { @MainActor in
+            defer { quotaCheckTask = nil }
+            let token = try await authManager.validAccessToken()
+            let available = try await GoogleDriveService.getStorageQuota(accessToken: token).availableBytes
+            lastQuotaCheck = (Date(), available)
+            return available
+        }
+        quotaCheckTask = task
+        return try await task.value
+    }
+
     private func acquireUploadSlot() async {
         if activeUploads < AppConfig.maxConcurrentUploads {
             activeUploads += 1
@@ -159,6 +185,7 @@ class UploadQueueManager {
     /// Clears per-account state when the user signs out.
     func resetAccountState() {
         publicSharingBlocked = false
+        lastQuotaCheck = nil
     }
 
     /// Creates the session's Drive folder right away (so the alert email can
@@ -242,10 +269,11 @@ class UploadQueueManager {
                             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                             guard !Task.isCancelled else { return }
                             do {
-                                let token = try await authManager.validAccessToken()
-                                let quota = try await GoogleDriveService.getStorageQuota(accessToken: token)
-                                // nil availableBytes = unlimited quota, always uploadable
-                                if (quota.availableBytes ?? Int64.max) > 0 { break }
+                                let available = try await sharedAvailableBytes(authManager: authManager)
+                                // nil = unlimited quota, always uploadable. Wait
+                                // until this clip fits: a clip that can't fit
+                                // would only be rejected again.
+                                if (available ?? Int64.max) >= max(chunk.fileSize, 1) { break }
                             } catch {
                                 // Couldn't read the quota (e.g. offline) — fall
                                 // through and let the upload attempt itself
