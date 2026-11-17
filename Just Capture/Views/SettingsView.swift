@@ -1,6 +1,14 @@
 import SwiftUI
 
+/// A setting another screen can open Settings at (the Record tab's pills).
+enum SettingsSection: Hashable {
+    case storage, location
+}
+
 struct SettingsView: View {
+    /// Set by another tab to scroll here to one setting; cleared once shown.
+    @Binding var scrollTarget: SettingsSection?
+
     @Environment(GoogleAuthManager.self) var authManager
     @Environment(DriveStorageManager.self) var driveStorageManager
     @Environment(UploadQueueManager.self) var uploadManager
@@ -11,10 +19,14 @@ struct SettingsView: View {
     @AppStorage("emailNote") private var emailNote: String = ""
     @AppStorage("emailAlertsEnabled") private var emailAlertsEnabled: Bool = true
     @AppStorage("includeTimeInEmail") private var includeTimeInEmail: Bool = true
-    @AppStorage("includeLocationInEmail") private var includeLocationInEmail: Bool = true
+    @AppStorage("locationEnabled") private var locationEnabled: Bool = true
     @FocusState private var focusedField: Field?
 
     @State private var testEmailState: TestEmailState = .idle
+    /// Addresses shown as pills, and the text still being typed. Together
+    /// they are the `emailRecipients` setting; see `saveRecipients()`.
+    @State private var committedRecipients: [String] = []
+    @State private var recipientDraft = ""
     @State private var isRefreshingStorage = false
     @State private var deviceFreeBytes: Int64?
     @State private var showSignOutConfirm = false
@@ -31,8 +43,47 @@ struct SettingsView: View {
         EmailSettings.parseRecipients(emailRecipients)
     }
 
+    /// Addresses to flag in the footer. What's still being typed is left out
+    /// until the field loses focus, so a half-typed address isn't an error.
     private var invalidRecipients: [String] {
-        recipients.filter { !EmailSettings.isValidEmail($0) }
+        let typing = focusedField == .recipients ? EmailSettings.parseRecipients(recipientDraft) : []
+        return recipients.filter { !EmailSettings.isValidEmail($0) && !typing.contains($0) }
+    }
+
+    private var hasInvalidRecipient: Bool {
+        recipients.contains { !EmailSettings.isValidEmail($0) }
+    }
+
+    /// Writes the pills plus whatever is in the field to the stored setting.
+    /// The half-typed text is included so an address still gets the email if
+    /// the user never presses return, as it did when this was one text field.
+    private func saveRecipients() {
+        emailRecipients = (committedRecipients + EmailSettings.parseRecipients(recipientDraft)).joined(separator: ", ")
+    }
+
+    private func loadRecipients() {
+        committedRecipients = EmailSettings.parseRecipients(emailRecipients)
+        recipientDraft = ""
+    }
+
+    /// Turns each valid address in the field into a pill; anything else stays
+    /// in the field to be fixed.
+    private func commitDraft() {
+        var rejected: [String] = []
+        for address in EmailSettings.parseRecipients(recipientDraft) {
+            if !EmailSettings.isValidEmail(address) {
+                rejected.append(address)
+            } else if !committedRecipients.contains(where: { $0.caseInsensitiveCompare(address) == .orderedSame }) {
+                committedRecipients.append(address)
+            }
+        }
+        recipientDraft = rejected.joined(separator: ", ")
+        saveRecipients()
+    }
+
+    private func removeRecipient(_ address: String) {
+        committedRecipients.removeAll { $0 == address }
+        saveRecipients()
     }
 
     private var appVersion: String {
@@ -44,50 +95,62 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                accountSection
-                recordingSection
-                emailSection
-                if emailAlertsEnabled {
-                    emailContentSection
-                }
-                storageSection
+            ScrollViewReader { proxy in
+                Form {
+                    accountSection
+                    recordingSection
+                    emailSection
+                    if emailAlertsEnabled {
+                        emailContentSection
+                    }
+                    storageSection
 
-                Section {
-                    LabeledContent("Version", value: appVersion)
-                    Link("Website", destination: AppConfig.homepageURL)
-                    Link("Privacy Policy", destination: AppConfig.privacyPolicyURL)
-                } header: {
-                    Text("About")
-                } footer: {
-                    Text("Just Capture records in short clips and tries to upload each one to your Google Drive as it goes.")
+                    Section {
+                        LabeledContent("Version", value: appVersion)
+                        Link("Website", destination: AppConfig.homepageURL)
+                        Link("Privacy Policy", destination: AppConfig.privacyPolicyURL)
+                    } header: {
+                        Text("About")
+                    } footer: {
+                        Text("Just Capture records in short clips and tries to upload each one to your Google Drive as it goes.")
+                    }
                 }
-            }
-            .navigationTitle("Settings")
-            .scrollContentBackground(.hidden)
-            .background(Theme.background.ignoresSafeArea())
-            .scrollDismissesKeyboard(.interactively)
-            .tint(Theme.accent)
-            .animation(.default, value: emailAlertsEnabled)
-            .onAppear {
-                deviceFreeBytes = DeviceStorage.availableBytes()
-                if EmailSettings.isDefaultSubject(emailSubject) {
-                    emailSubject = EmailSettings.defaultSubject
+                .navigationTitle("Settings")
+                .scrollContentBackground(.hidden)
+                .background(Theme.background.ignoresSafeArea())
+                .scrollDismissesKeyboard(.interactively)
+                .tint(Theme.accent)
+                .animation(.default, value: emailAlertsEnabled)
+                .onAppear {
+                    loadRecipients()
+                    Task { deviceFreeBytes = await DeviceStorage.availableBytes() }
+                    if emailSubject.isEmpty {
+                        emailSubject = EmailSettings.defaultSubject
+                    }
+                    if authManager.isSignedIn {
+                        Task { await driveStorageManager.refreshIfStale(authManager: authManager) }
+                    }
                 }
-                if authManager.isSignedIn {
-                    Task { await driveStorageManager.refreshIfStale(authManager: authManager) }
+                .toolbar {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("Done") { focusedField = nil }
+                    }
                 }
-            }
-            .toolbar {
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") { focusedField = nil }
+                .confirmationDialog("Sign out of Google?", isPresented: $showSignOutConfirm, titleVisibility: .visible) {
+                    Button("Sign Out", role: .destructive) { authManager.signOut() }
+                } message: {
+                    Text("Recording stops, and uploads and notification emails pause until you sign back in.")
                 }
-            }
-            .confirmationDialog("Sign out of Google?", isPresented: $showSignOutConfirm, titleVisibility: .visible) {
-                Button("Sign Out", role: .destructive) { authManager.signOut() }
-            } message: {
-                Text("Recording stops, and uploads and notification emails pause until you sign back in.")
+                .task(id: scrollTarget) {
+                    guard let target = scrollTarget else { return }
+                    // The first time the tab is opened the form hasn't been laid
+                    // out yet, and scrolling before that does nothing.
+                    try? await Task.sleep(for: .milliseconds(150))
+                    guard !Task.isCancelled else { return }
+                    withAnimation { proxy.scrollTo(target, anchor: .center) }
+                    scrollTarget = nil
+                }
             }
         }
     }
@@ -152,11 +215,12 @@ struct SettingsView: View {
             }
             .padding(.vertical, 4)
 
-            Toggle("Save location", isOn: $includeLocationInEmail)
+            Toggle("Save location", isOn: $locationEnabled)
+                .id(SettingsSection.location)
         } header: {
             Text("Recording")
         } footer: {
-            Text("Each clip starts uploading as soon as it ends. Shorter clips get footage off your phone sooner; longer clips use less data. Your location is saved when you start recording and at the end of each clip, on this phone and in Google Drive. Where you started is added to notification emails.")
+            Text("Each clip starts uploading as soon as it ends. Your location is saved when you start recording and at the end of each clip. The origin location is also included in the notification email.")
         }
     }
 
@@ -165,12 +229,41 @@ struct SettingsView: View {
             Toggle("Email notifications", isOn: $emailAlertsEnabled)
 
             if emailAlertsEnabled {
-                TextField("Recipients", text: $emailRecipients, prompt: Text(verbatim: "name@example.com, …"), axis: .vertical)
-                    .keyboardType(.emailAddress)
-                    .textContentType(.emailAddress)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .focused($focusedField, equals: .recipients)
+                // The chips and the field share one row, like a mail app's
+                // "To" line: the field follows the last chip and wraps with it.
+                FlowLayout(spacing: 8, lastFillsRow: true) {
+                    ForEach(committedRecipients, id: \.self) { address in
+                        RecipientPill(address: address, isValid: EmailSettings.isValidEmail(address)) {
+                            withAnimation(.snappy) { removeRecipient(address) }
+                        }
+                    }
+
+                    TextField("Add email address", text: $recipientDraft, prompt: Text(verbatim: "name@example.com"))
+                        .keyboardType(.emailAddress)
+                        .textContentType(.emailAddress)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .focused($focusedField, equals: .recipients)
+                        // Wide enough to type in; below this it gets its own line.
+                        .frame(minWidth: 150)
+                        .onChange(of: recipientDraft) { _, draft in
+                            // A comma, space or pasted list finishes an address.
+                            if draft.contains(where: { ",; \n\t".contains($0) }) {
+                                withAnimation(.snappy) { commitDraft() }
+                            } else {
+                                saveRecipients()
+                            }
+                        }
+                        .onSubmit {
+                            withAnimation(.snappy) { commitDraft() }
+                            // Stay in the field to add another, unless this one needs fixing.
+                            if recipientDraft.isEmpty { focusedField = .recipients }
+                        }
+                        .onChange(of: focusedField) { old, _ in
+                            if old == .recipients { withAnimation(.snappy) { commitDraft() } }
+                        }
+                }
+                .padding(.vertical, 4)
 
                 Button {
                     sendTestEmail()
@@ -181,7 +274,7 @@ struct SettingsView: View {
                         testEmailStatus
                     }
                 }
-                .disabled(recipients.isEmpty || !invalidRecipients.isEmpty || testEmailState == .sending)
+                .disabled(recipients.isEmpty || hasInvalidRecipient || testEmailState == .sending)
             }
         } header: {
             Text("Email Notifications")
@@ -191,7 +284,7 @@ struct SettingsView: View {
                     Text("Check \(invalidRecipients.joined(separator: ", ")) — \(invalidRecipients.count == 1 ? "it doesn't" : "they don't") look like an email address.")
                         .foregroundStyle(Theme.record)
                 } else if recipients.isEmpty {
-                    Text("Add at least one person to email when you start recording. Separate addresses with commas.")
+                    Text("Add at least one person to email when you start recording.")
                         .foregroundStyle(Theme.warning)
                 } else {
                     Text("When you start recording, \(recipients.count == 1 ? "1 person gets" : "\(recipients.count) people get") an email with a link to the live recording in your Google Drive.")
@@ -217,7 +310,7 @@ struct SettingsView: View {
             Label(message, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Theme.record)
-                .lineLimit(1)
+                .multilineTextAlignment(.trailing)
         }
     }
 
@@ -241,6 +334,7 @@ struct SettingsView: View {
             LabeledContent("Google Drive") {
                 driveStorageStatus
             }
+            .id(SettingsSection.storage)
             if let quota = driveStorageManager.quota, !quota.isUnlimited, let limit = quota.limit, limit > 0 {
                 Gauge(value: Double(quota.usage), in: 0...Double(limit)) {
                     EmptyView()
@@ -250,8 +344,8 @@ struct SettingsView: View {
             }
             Button {
                 isRefreshingStorage = true
-                deviceFreeBytes = DeviceStorage.availableBytes()
                 Task {
+                    deviceFreeBytes = await DeviceStorage.availableBytes()
                     await driveStorageManager.refresh(authManager: authManager)
                     isRefreshingStorage = false
                 }
@@ -322,7 +416,7 @@ struct SettingsView: View {
                 let token = try await authManager.validAccessToken()
                 try await GmailService.sendEmergencyEmail(
                     to: settings.recipients,
-                    subject: "[Test] " + EmailSettings.personalize(settings.subject, email: authManager.userEmail),
+                    subject: "[Test] " + settings.subject,
                     bodyNote: "This is a test from Just Capture. A real notification also includes a link to your recording in Google Drive." + (settings.note.isEmpty ? "" : "\n\n" + settings.note),
                     startedAt: settings.includeTime ? Date() : nil,
                     address: nil,
@@ -338,5 +432,48 @@ struct SettingsView: View {
             try? await Task.sleep(for: .seconds(4))
             if testEmailState != .sending { testEmailState = .idle }
         }
+    }
+}
+
+
+/// One accepted notification address, styled like a Gmail recipient chip:
+/// a round initial, the address, and a button to remove it.
+private struct RecipientPill: View {
+    let address: String
+    let isValid: Bool
+    let onRemove: () -> Void
+
+    @ScaledMetric(relativeTo: .subheadline) private var avatarSize: CGFloat = 24
+
+    var body: some View {
+        let color = isValid ? Theme.accent : Theme.record
+        HStack(spacing: 6) {
+            Text(isValid ? String(address.prefix(1)).uppercased() : "!")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+                .frame(width: avatarSize, height: avatarSize)
+                .background(color, in: Circle())
+                .accessibilityHidden(true)
+            // A long address is cut at the end, so who it is stays readable.
+            Text(address)
+                .font(.subheadline)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Theme.secondaryText)
+                    .padding(4)
+            }
+            // Without this a tap anywhere in the form row presses every button in it.
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Remove \(address)")
+        }
+        .padding(.leading, 4)
+        .padding(.trailing, 6)
+        .padding(.vertical, 4)
+        .background(Theme.surfaceRaised, in: Capsule())
+        .overlay(Capsule().strokeBorder(isValid ? Theme.stroke : Theme.record.opacity(0.7), lineWidth: 1))
     }
 }

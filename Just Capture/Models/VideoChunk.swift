@@ -14,7 +14,14 @@ class VideoChunk: Identifiable, Codable {
     var status: UploadStatus
     var uploadProgress: Double
     var driveFileId: String?
-    
+    /// Drive's resumable upload link for this clip. Kept so a retry can pick up
+    /// the same upload instead of starting another. Optional so clips saved
+    /// before this existed still load.
+    var uploadSessionURL: URL?
+    /// Failed tries while online since the last success or manual retry. Saved
+    /// because a failed background upload may not be noticed until a later launch.
+    var uploadAttempts: Int?
+
     init(index: Int, localURL: URL, duration: TimeInterval = 0, fileSize: Int64 = 0) {
         self.id = UUID()
         self.index = index

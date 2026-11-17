@@ -1,15 +1,29 @@
 import SwiftUI
 import GoogleSignIn
 
+/// Runs for every launch, including background launches where SwiftUI may build
+/// no views. It's also the only way iOS reports finished background transfers.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        AppServices.shared.launch()
+        return true
+    }
+
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
+        AppServices.shared.handleBackgroundEvents(identifier: identifier, completion: completionHandler)
+    }
+}
+
 @main
 struct Just_Capture: App {
-    @State private var authManager = GoogleAuthManager()
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @State private var authManager = AppServices.shared.authManager
     @State private var cameraManager = CameraManager()
-    @State private var locationManager = LocationManager()
-    @State private var uploadQueueManager = UploadQueueManager()
-    @State private var driveStorageManager = DriveStorageManager()
-    @State private var emailQueueManager = EmailQueueManager()
-    @State private var sessionStore = SessionStore()
+    @State private var locationManager = AppServices.shared.locationManager
+    @State private var uploadQueueManager = AppServices.shared.uploadQueueManager
+    @State private var driveStorageManager = AppServices.shared.driveStorageManager
+    @State private var emailQueueManager = AppServices.shared.emailQueueManager
+    @State private var sessionStore = AppServices.shared.sessionStore
     @State private var sharedFolderStore = SharedFolderStore()
 
     var body: some Scene {
@@ -24,25 +38,8 @@ struct Just_Capture: App {
                 .environment(sessionStore)
                 .environment(sharedFolderStore)
                 .preferredColorScheme(.dark)
-                .onAppear {
-                    uploadQueueManager.sessionStore = sessionStore
-                    emailQueueManager.sessionStore = sessionStore
-                    emailQueueManager.locationManager = locationManager
-                    driveStorageManager.sessionStore = sessionStore
-                    uploadQueueManager.onFolderCreated = { [emailQueueManager, authManager] session in
-                        emailQueueManager.sendLinkFollowUps(forSessionId: session.id, authManager: authManager)
-                    }
-                    uploadQueueManager.onChunkUploaded = { [driveStorageManager, authManager] chunk in
-                        driveStorageManager.recordUpload(bytes: chunk.fileSize, authManager: authManager)
-                    }
-                }
                 .onOpenURL { url in
                     GIDSignIn.sharedInstance.handle(url)
-                }
-                .task {
-                    // Leftover uploads/emails are resumed by ContentView once
-                    // this flips isSignedIn.
-                    await authManager.restoreSignIn()
                 }
         }
     }

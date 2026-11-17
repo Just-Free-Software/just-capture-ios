@@ -51,6 +51,66 @@ extension View {
     }
 }
 
+/// Lays views out left to right, wrapping to a new line when the row is full.
+/// A view wider than the whole row is squeezed to fit it.
+///
+/// With `lastFillsRow`, the last view (a text field after a run of chips)
+/// takes whatever is left of the final row, or a row of its own when what's
+/// left is narrower than its minimum width.
+nonisolated struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var lastFillsRow = false
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(subviews, in: proposal.width ?? .infinity)
+        let height = rows.last.map { $0.y + $0.height } ?? 0
+        let widest = rows.map(\.width).max() ?? 0
+        return CGSize(width: proposal.width ?? widest, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for row in arrange(subviews, in: bounds.width) {
+            for item in row.items {
+                subviews[item.index].place(
+                    at: CGPoint(x: bounds.minX + item.x, y: bounds.minY + row.y + (row.height - item.size.height) / 2),
+                    proposal: ProposedViewSize(item.size)
+                )
+            }
+        }
+    }
+
+    private struct Row {
+        var y: CGFloat
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+        var items: [(index: Int, x: CGFloat, size: CGSize)] = []
+    }
+
+    private func arrange(_ subviews: Subviews, in maxWidth: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var row = Row(y: 0)
+        for index in subviews.indices {
+            let fills = lastFillsRow && index == subviews.indices.last && maxWidth.isFinite
+            var size = subviews[index].sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+            // A filling view only needs its minimum width to stay on the row.
+            let needed = fills ? subviews[index].sizeThatFits(ProposedViewSize(width: 0, height: nil)).width : size.width
+            if !row.items.isEmpty && row.width + spacing + needed > maxWidth {
+                rows.append(row)
+                row = Row(y: row.y + row.height + spacing)
+            }
+            let x = row.items.isEmpty ? 0 : row.width + spacing
+            if fills {
+                size = subviews[index].sizeThatFits(ProposedViewSize(width: max(maxWidth - x, 0), height: nil))
+            }
+            row.items.append((index, x, size))
+            row.width = x + size.width
+            row.height = max(row.height, size.height)
+        }
+        if !row.items.isEmpty { rows.append(row) }
+        return rows
+    }
+}
+
 /// Small coloured capsule with an icon and label, e.g. "Uploaded".
 struct StatusBadge: View {
     let text: String
@@ -58,10 +118,16 @@ struct StatusBadge: View {
     let color: Color
 
     var body: some View {
-        Label(text, systemImage: systemImage)
+        // An HStack rather than a Label: inside a List, a Label's icon gets
+        // the list's wide icon column, which leaves a gap before the text.
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+            Text(text)
+        }
             .font(.caption2.weight(.semibold))
-            .labelStyle(.titleAndIcon)
+            .lineLimit(1)
             .foregroundStyle(color)
+            .accessibilityElement(children: .combine)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(color.opacity(0.15), in: Capsule())
@@ -136,16 +202,36 @@ struct StatView: View {
     let color: Color
 
     var body: some View {
+        // Fixed size so a column is never narrower than its text. StatGroup
+        // stacks the stats when they don't fit side by side.
         VStack(alignment: .leading, spacing: 2) {
             Text(value)
                 .font(.title2.weight(.bold).monospacedDigit())
                 .foregroundStyle(color)
                 .contentTransition(.numericText())
+                .lineLimit(1)
+                .fixedSize()
             Text(title)
                 .font(.caption)
                 .foregroundStyle(Theme.secondaryText)
+                .lineLimit(1)
+                .fixedSize()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A row of `StatView`s that becomes a column when they don't fit side by
+/// side, which happens at the larger Dynamic Type sizes.
+struct StatGroup<Content: View>: View {
+    var spacing: CGFloat = 12
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: spacing) { content }
+            VStack(alignment: .leading, spacing: 12) { content }
+        }
     }
 }
 

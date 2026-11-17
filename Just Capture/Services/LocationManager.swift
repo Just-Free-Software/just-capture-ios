@@ -124,7 +124,7 @@ class LocationManager: NSObject, CLLocationManagerDelegate {
     
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         Task { @MainActor in
-            if self.trackingStartedAt != nil, !EmailSettings.current.includeLocation {
+            if self.trackingStartedAt != nil, !EmailSettings.current.locationEnabled {
                 // "Save location" was turned off mid-recording.
                 self.stopTracking()
                 return
@@ -155,7 +155,7 @@ class LocationManager: NSObject, CLLocationManagerDelegate {
             self.authorizationStatus = manager.authorizationStatus
             // Warm up a fix as soon as we're allowed to, so the first alert
             // email isn't sent before any location is known.
-            if EmailSettings.current.includeLocation,
+            if EmailSettings.current.locationEnabled,
                manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
                 // A one-off request would cancel tracking that's already on.
                 if self.trackingStartedAt != nil {

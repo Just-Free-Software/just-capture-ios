@@ -46,13 +46,26 @@ class DriveSessionDownloader {
         let size: Int64?
     }
 
+    /// A clip of the user's own session that this phone recorded and may
+    /// still have, so it can be played without downloading it back.
+    struct LocalClip {
+        /// Nil until the clip has been uploaded.
+        let fileId: String?
+        let url: URL
+        let size: Int64
+    }
+
     private struct Manifest: Codable {
         var folderName: String?
         var segments: [Segment]
+        /// The folder's `location.txt`, kept so it shows without the network.
+        /// Optional so manifests saved before this existed still load.
+        var locationText: String?
     }
 
     let folderId: String
     let source: Source
+    private let localClips: [LocalClip]
 
     private(set) var sync: SyncState = .idle
     private(set) var downloadedBytes: Int64 = 0
@@ -71,13 +84,20 @@ class DriveSessionDownloader {
     private(set) var duration: TimeInterval = 0
     /// Clips that downloaded but couldn't be read, left out of playback.
     private(set) var skippedClips = 0
+    /// Contents of the folder's `location.txt`, if it has one.
+    private(set) var locationText: String?
 
-    init(folderId: String, source: Source) {
+    /// `locationText` is for the user's own sessions, where the phone that
+    /// recorded it already has what `location.txt` would say.
+    init(folderId: String, source: Source, localClips: [LocalClip] = [], locationText: String? = nil) {
         self.folderId = folderId
         self.source = source
+        self.localClips = localClips
+        self.locationText = locationText
         if let manifest = Self.loadManifest(folderId: folderId, source: source) {
             segments = manifest.segments
             folderName = manifest.folderName
+            if locationText == nil { self.locationText = manifest.locationText }
         }
     }
 
@@ -121,7 +141,7 @@ class DriveSessionDownloader {
         values.isExcludedFromBackup = true
         try? directory.setResourceValues(values)
 
-        let data = try JSONEncoder().encode(Manifest(folderName: folderName, segments: segments))
+        let data = try JSONEncoder().encode(Manifest(folderName: folderName, segments: segments, locationText: locationText))
         try data.write(to: Self.manifestURL(folderId: folderId, source: source), options: .atomic)
         try writeLocalPlaylist()
     }
@@ -137,17 +157,59 @@ class DriveSessionDownloader {
         try m3u8.write(to: directoryURL.appendingPathComponent("playlist.m3u8"), atomically: true, encoding: .utf8)
     }
 
+    // MARK: - Clips recorded on this phone
+
+    /// True when every clip of the session is still on this phone, so Drive
+    /// can't have anything this phone lacks.
+    var hasAllClipsLocally: Bool {
+        !localClips.isEmpty && localClips.allSatisfy { FileManager.default.fileExists(atPath: $0.url.path) }
+    }
+
+    /// The recorded file for a segment, if this phone still has it.
+    private func localURL(for segment: Segment) -> URL? {
+        let clip = localClips.first { $0.fileId == segment.fileId } ?? localClips.first { $0.url.lastPathComponent == segment.fileName }
+        guard let clip, FileManager.default.fileExists(atPath: clip.url.path) else { return nil }
+        return clip.url
+    }
+
+    /// Where a segment plays from: the recording if it's here, otherwise the
+    /// copy downloaded from Drive.
+    private func playbackURL(for segment: Segment) -> URL {
+        localURL(for: segment) ?? directoryURL.appendingPathComponent(segment.fileName)
+    }
+
+    /// Adds the recorded clips that `list` doesn't have yet, which includes
+    /// clips that haven't been uploaded.
+    private func includingLocalClips(_ list: [Segment]) -> [Segment] {
+        let ids = Set(list.map(\.fileId))
+        let names = Set(list.map(\.fileName))
+        let extra = localClips
+            .filter { clip in
+                FileManager.default.fileExists(atPath: clip.url.path)
+                    && !(clip.fileId.map(ids.contains) ?? false)
+                    && !names.contains(clip.url.lastPathComponent)
+            }
+            .map { Segment(fileId: $0.fileId ?? "local:\($0.url.lastPathComponent)", fileName: $0.url.lastPathComponent, size: $0.size) }
+        guard !extra.isEmpty else { return list }
+        let merged = list + extra
+        // Recorded clips are named chunk_N.mp4; put them back in order. If
+        // any name doesn't fit that, leave Drive's order alone.
+        guard merged.allSatisfy({ Self.chunkIndex($0.fileName) != .max }) else { return merged }
+        return merged.sorted { Self.chunkIndex($0.fileName) < Self.chunkIndex($1.fileName) }
+    }
+
     // MARK: - Playback
 
     /// Builds the player from clips already on the phone. No network.
     func loadSaved() async {
+        segments = includingLocalClips(segments)
         guard !segments.isEmpty else { return }
         await rebuildPlayer()
     }
 
     private func rebuildPlayer() async {
         let urls = segments
-            .map { directoryURL.appendingPathComponent($0.fileName) }
+            .map { playbackURL(for: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
         guard let composition = try? await makeComposition(from: urls) else { return }
         duration = composition.duration.seconds
@@ -173,10 +235,25 @@ class DriveSessionDownloader {
             try await resolveFolderName(authManager: authManager)
             let files = try await GoogleDriveService.listFiles(inFolder: folderId, access: access(authManager))
             recordRemote(files)
+            await refreshLocation(in: files, authManager: authManager)
             sync = .idle
         } catch {
             sync = .failed(error.localizedDescription)
         }
+    }
+
+    /// Fetches the folder's `location.txt`: one request per sync, and only
+    /// when the listing shows the file. It's the last request of a sync and a
+    /// failure is ignored, so a rate limit here isn't followed by anything.
+    private func refreshLocation(in files: [DriveFile], authManager: GoogleAuthManager) async {
+        guard let file = files.first(where: { $0.name == "location.txt" }),
+              let access = try? await access(authManager),
+              let data = try? await GoogleDriveService.downloadData(fileId: file.id, access: access) else { return }
+        let text = String(decoding: data, as: UTF8.self)
+        guard text != locationText else { return }
+        locationText = text
+        // With no clips yet there's no saved folder to keep it in.
+        if !segments.isEmpty { try? saveManifest() }
     }
 
     /// Downloads every clip that isn't on the phone yet, then rebuilds the
@@ -208,15 +285,16 @@ class DriveSessionDownloader {
                 try await GoogleDriveService.downloadFile(fileId: segment.fileId, to: destination, access: access(authManager))
                 downloadedBytes += segment.size ?? fileSize(at: destination)
                 // Saved per clip, so an interrupted sync keeps what it got.
-                segments = ordered.filter { isAlreadyDownloaded($0) }
+                segments = includingLocalClips(ordered.filter { isAlreadyDownloaded($0) })
                 try saveManifest()
             }
-            segments = ordered.filter { isAlreadyDownloaded($0) }
+            segments = includingLocalClips(ordered.filter { isAlreadyDownloaded($0) })
             try saveManifest()
             newClipIds = []
 
             sync = .preparing
             await rebuildPlayer()
+            await refreshLocation(in: files, authManager: authManager)
             sync = .idle
         } catch is CancellationError {
             sync = .idle
@@ -291,6 +369,7 @@ class DriveSessionDownloader {
     }
 
     private func isAlreadyDownloaded(_ segment: Segment) -> Bool {
+        if localURL(for: segment) != nil { return true }
         let url = directoryURL.appendingPathComponent(segment.fileName)
         guard FileManager.default.fileExists(atPath: url.path) else { return false }
         guard let expected = segment.size else { return true }

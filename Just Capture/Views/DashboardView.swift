@@ -5,8 +5,6 @@ struct DashboardView: View {
     @Environment(UploadQueueManager.self) private var uploadManager
     @Environment(EmailQueueManager.self) private var emailQueueManager
 
-    @State private var sessionToDelete: RecordingSession?
-
     private var totalDuration: TimeInterval {
         sessionStore.sessions.reduce(0) { $0 + $1.totalDuration }
     }
@@ -43,14 +41,6 @@ struct DashboardView: View {
                                 .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
                                 .listRowBackground(Color.clear)
                                 .listRowSeparator(.hidden)
-                                .swipeActions(edge: .trailing) {
-                                    if !session.isActive {
-                                        Button("Delete", systemImage: "trash") {
-                                            sessionToDelete = session
-                                        }
-                                        .tint(Theme.record)
-                                    }
-                                }
                             }
                         } header: {
                             Text("Sessions")
@@ -72,12 +62,11 @@ struct DashboardView: View {
                     ContentUnavailableView("Session Deleted", systemImage: "trash")
                 }
             }
-            .deleteSessionDialog(session: $sessionToDelete)
         }
     }
 
     private var summary: some View {
-        HStack(spacing: 12) {
+        StatGroup {
             StatView(title: "Recorded", value: Formatters.duration(totalDuration), color: .white)
             StatView(title: "Uploading", value: "\(totalQueued)", color: totalQueued > 0 ? Theme.accent : Theme.secondaryText)
             StatView(title: "Failed", value: "\(totalFailed)", color: totalFailed > 0 ? Theme.warning : Theme.secondaryText)
@@ -91,20 +80,29 @@ struct DashboardView: View {
 private struct SessionRow: View {
     let session: RecordingSession
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     var body: some View {
         let status = session.statusSummary
         HStack(spacing: 14) {
-            Image(systemName: session.isActive ? "record.circle.fill" : "video.fill")
-                .font(.headline)
-                .foregroundStyle(status.color)
-                .frame(width: 44, height: 44)
-                .background(status.color.opacity(0.15), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            // At accessibility text sizes the icon box goes, since the badge
+            // has the same icon and color and the text needs the width.
+            if !dynamicTypeSize.isAccessibilitySize {
+                Image(systemName: session.isActive ? "record.circle.fill" : "video.fill")
+                    .font(.headline)
+                    .foregroundStyle(status.color)
+                    .frame(width: 44, height: 44)
+                    .background(status.color.opacity(0.15), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
 
+            // The badge sits above the text rather than beside it: as a third
+            // column it left the text a few characters of width on a zoomed
+            // display or with large text.
             VStack(alignment: .leading, spacing: 4) {
+                StatusBadge(text: status.text, systemImage: status.icon, color: status.color)
+                    .padding(.bottom, 2)
                 Text("\(session.startDate.formatted(.dateTime.month(.abbreviated).day())), \(session.startDate.formatted(date: .omitted, time: .shortened))")
                     .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
                     .foregroundStyle(.white)
                 Text(detailText)
                     .font(.caption)
@@ -116,10 +114,6 @@ private struct SessionRow: View {
                         .padding(.top, 2)
                 }
             }
-
-            Spacer(minLength: 8)
-            StatusBadge(text: status.text, systemImage: status.icon, color: status.color)
-                .fixedSize()
         }
         .card(padding: 12)
     }
@@ -148,7 +142,12 @@ struct SessionDetailView: View {
         emailQueueManager.jobs.filter { $0.sessionId == session.id }
     }
 
-    private let columns = [GridItem(.adaptive(minimum: 104), spacing: 10)]
+    /// Tiles grow with the text drawn on them, up to two columns on a phone.
+    @ScaledMetric(relativeTo: .caption) private var tileMinWidth: CGFloat = 104
+
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: min(tileMinWidth, 160)), spacing: 10)]
+    }
 
     var body: some View {
         ScrollView {
@@ -208,7 +207,13 @@ struct SessionDetailView: View {
         }
         .sheet(isPresented: $playingFromDrive) {
             if let folderId = session.driveFolderId {
-                DrivePlaybackView(folderId: folderId, source: .ownDrive, title: session.startDate.formatted(date: .abbreviated, time: .shortened))
+                DrivePlaybackView(
+                    folderId: folderId,
+                    source: .ownDrive,
+                    title: session.startDate.formatted(date: .abbreviated, time: .shortened),
+                    localClips: session.chunks.map { .init(fileId: $0.driveFileId, url: $0.localURL, size: $0.fileSize) },
+                    locationText: session.locationText
+                )
             }
         }
         .deleteSessionDialog(session: $sessionToDelete, onDeleted: { dismiss() })
@@ -217,21 +222,20 @@ struct SessionDetailView: View {
     private var overviewCard: some View {
         let status = session.statusSummary
         return VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(Formatters.duration(session.totalDuration))
-                        .font(.largeTitle.weight(.bold).monospacedDigit())
-                        .foregroundStyle(.white)
-                        .contentTransition(.numericText())
-                    Text("\(Formatters.bytes(session.totalBytes)) · \(Int(session.chunkDuration))s clips")
-                        .font(.caption)
-                        .foregroundStyle(Theme.secondaryText)
+            // The badge drops below when large text leaves no room beside the duration.
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    overviewHeadline
+                    Spacer()
+                    StatusBadge(text: status.text, systemImage: status.icon, color: status.color)
                 }
-                Spacer()
-                StatusBadge(text: status.text, systemImage: status.icon, color: status.color)
+                VStack(alignment: .leading, spacing: 8) {
+                    overviewHeadline
+                    StatusBadge(text: status.text, systemImage: status.icon, color: status.color)
+                }
             }
 
-            HStack {
+            StatGroup(spacing: 8) {
                 StatView(title: "Uploaded", value: "\(session.uploadedCount)", color: Theme.success)
                 StatView(title: "Queued", value: "\(session.queuedCount)", color: session.queuedCount > 0 ? Theme.accent : Theme.secondaryText)
                 StatView(title: "Failed", value: "\(session.failedCount)", color: session.failedCount > 0 ? Theme.record : Theme.secondaryText)
@@ -252,43 +256,68 @@ struct SessionDetailView: View {
                 .tint(Theme.accent)
             }
 
-            HStack(spacing: 10) {
-                if let link = session.driveFolderLink, let url = URL(string: link) {
-                    Link(destination: url) {
-                        Label("Drive", systemImage: "folder.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(Theme.accent)
-                }
-                if session.driveFolderId != nil && session.uploadedCount > 0 {
-                    Button {
-                        playingFromDrive = true
-                    } label: {
-                        Label("Play", systemImage: "play.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glass)
-                    .tint(Theme.accent)
-                }
-                if session.failedCount > 0 {
-                    Button {
-                        for chunk in session.chunks where chunk.status == .failed {
-                            uploadManager.retryChunk(chunk, session: session, authManager: authManager)
-                        }
-                    } label: {
-                        Label("Retry \(session.failedCount)", systemImage: "arrow.clockwise")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glass)
-                    .tint(Theme.warning)
-                }
+            // Side by side when the titles fit, otherwise one button per line.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { actionButtons }
+                VStack(spacing: 10) { actionButtons }
             }
             .font(.subheadline.weight(.semibold))
             .lineLimit(1)
             .controlSize(.large)
         }
         .card()
+    }
+
+    private var overviewHeadline: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(Formatters.duration(session.totalDuration))
+                .font(.largeTitle.weight(.bold).monospacedDigit())
+                .foregroundStyle(.white)
+                .contentTransition(.numericText())
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+            Text("\(Formatters.bytes(session.totalBytes)) · \(Int(session.chunkDuration))s clips")
+                .font(.caption)
+                .foregroundStyle(Theme.secondaryText)
+        }
+    }
+
+    /// Labels are fixed size so a button is never narrower than its title.
+    @ViewBuilder
+    private var actionButtons: some View {
+        if let link = session.driveFolderLink, let url = URL(string: link) {
+            Link(destination: url) {
+                Label("Drive", systemImage: "folder.fill")
+                    .fixedSize()
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+            .tint(Theme.accent)
+        }
+        if session.driveFolderId != nil && session.uploadedCount > 0 {
+            Button {
+                playingFromDrive = true
+            } label: {
+                Label("Play", systemImage: "play.fill")
+                    .fixedSize()
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glass)
+            .tint(Theme.accent)
+        }
+        if session.failedCount > 0 {
+            Button {
+                for chunk in session.chunks where chunk.status == .failed {
+                    uploadManager.retryChunk(chunk, session: session, authManager: authManager)
+                }
+            } label: {
+                Label("Retry \(session.failedCount)", systemImage: "arrow.clockwise")
+                    .fixedSize()
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glass)
+            .tint(Theme.warning)
+        }
     }
 }
 
@@ -336,11 +365,9 @@ private struct EmailJobRow: View {
                 Text(job.subject)
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.white)
-                    .lineLimit(1)
                 Text("\(status.text) · \(job.recipients.joined(separator: ", "))")
                     .font(.caption)
                     .foregroundStyle(Theme.secondaryText)
-                    .lineLimit(1)
             }
             Spacer(minLength: 8)
             if job.status == .failed {

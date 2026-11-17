@@ -154,12 +154,21 @@ enum GoogleDriveService {
         }
     }
     
-    static func uploadFile(localURL: URL, fileName: String, folderId: String, accessToken: String, onProgress: @Sendable @escaping (Double) -> Void) async throws -> String {
+    /// Where a resumable upload stands on Drive's side.
+    enum ResumableUploadState: Equatable {
+        case complete(fileId: String)
+        /// Drive has everything before this byte offset.
+        case incomplete(nextOffset: Int64)
+        /// The upload link is no longer valid, so a new one is needed.
+        case expired
+    }
+
+    /// Creates a resumable upload and returns its link. This needs a token, but
+    /// sending bytes to the link doesn't, which is what lets iOS finish the
+    /// upload long after the token has expired.
+    static func createUploadSession(fileName: String, fileSize: Int64, folderId: String, accessToken: String) async throws -> URL {
         guard let url = URL(string: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable") else { throw URLError(.badURL) }
-        
-        let fileData = try Data(contentsOf: localURL)
-        let fileSize = fileData.count
-        
+
         var initiateRequest = URLRequest(url: url)
         initiateRequest.httpMethod = "POST"
         initiateRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -177,58 +186,43 @@ enum GoogleDriveService {
               let resumableURL = URL(string: resumableURLString) else {
             throw URLError(.badServerResponse)
         }
-        
-        let chunkSize = 2 * 1024 * 1024
-        var offset = 0
-        var fileId: String? = nil
-        
-        if fileSize <= chunkSize {
-            var uploadRequest = URLRequest(url: resumableURL)
-            uploadRequest.httpMethod = "PUT"
-            uploadRequest.setValue("\(fileSize)", forHTTPHeaderField: "Content-Length")
-            let (data, uploadResponse) = try await URLSession.shared.upload(for: uploadRequest, from: fileData)
-            if let httpUpResp = uploadResponse as? HTTPURLResponse, (200...299).contains(httpUpResp.statusCode) {
-                let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                fileId = json?["id"] as? String
-                onProgress(1.0)
-            } else {
-                if let httpUpResp = uploadResponse as? HTTPURLResponse {
-                    try throwIfQuotaExceeded(data: data, statusCode: httpUpResp.statusCode)
-                }
-                throw URLError(.badServerResponse)
-            }
-        } else {
-            while offset < fileSize {
-                let currentChunkSize = min(chunkSize, fileSize - offset)
-                let chunkData = fileData.subdata(in: offset..<(offset + currentChunkSize))
-                
-                var uploadRequest = URLRequest(url: resumableURL)
-                uploadRequest.httpMethod = "PUT"
-                uploadRequest.setValue("\(currentChunkSize)", forHTTPHeaderField: "Content-Length")
-                uploadRequest.setValue("bytes \(offset)-\(offset + currentChunkSize - 1)/\(fileSize)", forHTTPHeaderField: "Content-Range")
-                
-                let (data, uploadResponse) = try await URLSession.shared.upload(for: uploadRequest, from: chunkData)
-                if let httpUpResp = uploadResponse as? HTTPURLResponse {
-                    if httpUpResp.statusCode == 308 {
-                        offset += currentChunkSize
-                        onProgress(Double(offset) / Double(fileSize))
-                    } else if (200...299).contains(httpUpResp.statusCode) {
-                        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                        fileId = json?["id"] as? String
-                        onProgress(1.0)
-                        break
-                    } else {
-                        try throwIfQuotaExceeded(data: data, statusCode: httpUpResp.statusCode)
-                        throw URLError(.badServerResponse)
-                    }
-                }
-            }
-        }
-        
-        guard let id = fileId else { throw URLError(.badServerResponse) }
-        return id
+        return resumableURL
     }
-    
+
+    /// Asks Drive how much of an upload arrived. An earlier attempt may have
+    /// finished with the reply lost, so this is checked before sending again,
+    /// which would otherwise waste data or leave a duplicate clip in the folder.
+    static func resumableUploadState(sessionURL: URL, fileSize: Int64) async throws -> ResumableUploadState {
+        var request = URLRequest(url: sessionURL)
+        request.httpMethod = "PUT"
+        request.setValue("0", forHTTPHeaderField: "Content-Length")
+        request.setValue("bytes */\(fileSize)", forHTTPHeaderField: "Content-Range")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        switch httpResponse.statusCode {
+        case 200...299:
+            guard let id = uploadedFileId(from: data) else { throw URLError(.badServerResponse) }
+            return .complete(fileId: id)
+        case 308:
+            // "Range: bytes=0-N" means bytes up to N arrived; no header, none did.
+            let range = httpResponse.value(forHTTPHeaderField: "Range")
+            let last = range?.split(separator: "-").last.flatMap { Int64($0) }
+            return .incomplete(nextOffset: last.map { $0 + 1 } ?? 0)
+        case 404, 410:
+            return .expired
+        default:
+            try throwIfQuotaExceeded(data: data, statusCode: httpResponse.statusCode)
+            throw URLError(.badServerResponse)
+        }
+    }
+
+    /// The new file's id from the reply to an upload's final request.
+    static func uploadedFileId(from data: Data) -> String? {
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return json?["id"] as? String
+    }
+
     static func uploadOrUpdatePlaylist(content: String, folderId: String, existingFileId: String?, accessToken: String) async throws -> String {
         try await uploadOrUpdateTextFile(name: "playlist.m3u8", mimeType: "application/x-mpegURL", content: content, folderId: folderId, existingFileId: existingFileId, accessToken: accessToken)
     }

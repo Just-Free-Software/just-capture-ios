@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import MapKit
 
 /// Plays a Drive session folder's clips back to back, in playlist order.
 /// Clips already on the phone play straight away; new ones on Drive are
@@ -13,19 +14,47 @@ struct DrivePlaybackView: View {
 
     @State private var downloader: DriveSessionDownloader
     @State private var player = AVPlayer()
+    @State private var didLoad = false
 
-    init(folderId: String, source: DriveSessionDownloader.Source, title: String) {
+    /// `localClips` are the session's clips recorded on this phone, which
+    /// play from where they are instead of being downloaded back.
+    init(
+        folderId: String,
+        source: DriveSessionDownloader.Source,
+        title: String,
+        localClips: [DriveSessionDownloader.LocalClip] = [],
+        locationText: String? = nil
+    ) {
         self.title = title
-        _downloader = State(initialValue: DriveSessionDownloader(folderId: folderId, source: source))
+        _downloader = State(initialValue: DriveSessionDownloader(folderId: folderId, source: source, localClips: localClips, locationText: locationText))
+    }
+
+    private var locationInfo: SessionLocationInfo? {
+        downloader.locationText.flatMap(SessionLocationInfo.init(text:))
     }
 
     var body: some View {
         NavigationStack {
             ZStack {
                 Theme.background.ignoresSafeArea()
-                if downloader.playerItem != nil {
+                if downloader.playerItem != nil, let info = locationInfo {
+                    // With location details the player takes the top of the
+                    // screen and the rest scrolls; full screen is one tap away.
+                    VStack(spacing: 0) {
+                        FullScreenCapablePlayer(player: player)
+                            .ignoresSafeArea(edges: .horizontal)
+                            .containerRelativeFrame(.vertical) { height, _ in height * 0.5 }
+                        ScrollView {
+                            VStack(spacing: 12) {
+                                statusCard
+                                SessionLocationCard(info: info)
+                            }
+                            .padding(16)
+                        }
+                    }
+                } else if downloader.playerItem != nil {
                     VStack(spacing: 12) {
-                        VideoPlayer(player: player)
+                        FullScreenCapablePlayer(player: player)
                             .ignoresSafeArea(edges: .horizontal)
                         statusCard
                             .padding(.horizontal, 16)
@@ -58,12 +87,17 @@ struct DrivePlaybackView: View {
                 }
             }
             .task {
+                // Full screen covers this view and uncovers it again, which
+                // would otherwise rerun this and rebuild what's playing.
+                guard !didLoad else { return }
+                didLoad = true
                 await downloader.loadSaved()
                 if downloader.playerItem == nil {
                     await downloader.downloadNewClips(authManager: authManager)
-                } else {
+                } else if !downloader.hasAllClipsLocally {
                     // One listing request, so the screen can say whether
-                    // there's anything new.
+                    // there's anything new. Skipped when this phone recorded
+                    // the session and still has every clip.
                     await downloader.checkForNewClips(authManager: authManager)
                 }
             }
@@ -73,9 +107,6 @@ struct DrivePlaybackView: View {
             }
             .onChange(of: downloader.sync) { _, sync in
                 if !sync.isBusy { sharedFolderStore.update(from: downloader) }
-            }
-            .onDisappear {
-                player.pause()
             }
         }
     }
@@ -118,6 +149,13 @@ struct DrivePlaybackView: View {
                 Text("\(downloader.skippedClips) clip\(downloader.skippedClips == 1 ? "" : "s") couldn't be read and \(downloader.skippedClips == 1 ? "was" : "were") skipped.")
                     .font(.caption)
                     .foregroundStyle(Theme.warning)
+            }
+
+            // Only after a check, so it isn't claimed before Drive was asked.
+            if downloader.locationText == nil, downloader.lastCheckedAt != nil {
+                Label("No location was saved with this recording.", systemImage: "location.slash")
+                    .font(.caption)
+                    .foregroundStyle(Theme.secondaryText)
             }
 
             syncRow
@@ -229,12 +267,169 @@ struct DrivePlaybackView: View {
     }
 }
 
+/// Where a session was recorded: when it started, a map of the route, and
+/// the position saved at the end of each clip.
+private struct SessionLocationCard: View {
+    let info: SessionLocationInfo
+
+    /// Long recordings have hundreds of points; show the first few until asked.
+    @State private var showsAllPoints = false
+    private static let collapsedPointCount = 5
+
+    private var visiblePoints: [SessionLocationInfo.Point] {
+        showsAllPoints ? info.points : Array(info.points.prefix(Self.collapsedPointCount))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Location", systemImage: "mappin.and.ellipse")
+                .font(.headline)
+                .foregroundStyle(.white)
+
+            VStack(alignment: .leading, spacing: 4) {
+                if let address = info.startingAddress {
+                    Text(address)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white)
+                }
+                if let started = info.started {
+                    Text("Started \(started)")
+                        .font(.caption)
+                        .foregroundStyle(Theme.secondaryText)
+                }
+            }
+
+            let route = info.route
+            if let first = route.first {
+                Map {
+                    if route.count > 1 {
+                        MapPolyline(coordinates: route)
+                            .stroke(Theme.accent, lineWidth: 4)
+                    }
+                    Marker("Start", coordinate: first)
+                        .tint(Theme.success)
+                    if route.count > 1, let last = route.last {
+                        Marker("Latest", coordinate: last)
+                            .tint(Theme.record)
+                    }
+                }
+                .frame(height: 180)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .accessibilityLabel("Map of the recording's route")
+            }
+
+            if !info.points.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(visiblePoints) { point in
+                        LocationPointRow(point: point)
+                    }
+                }
+                if info.points.count > Self.collapsedPointCount {
+                    Button(showsAllPoints ? "Show Fewer" : "Show All \(info.points.count) Locations") {
+                        withAnimation(.snappy) { showsAllPoints.toggle() }
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .tint(Theme.accent)
+                }
+            }
+        }
+        .card(padding: 14)
+    }
+}
+
+/// One saved position. Opens in Maps when it has coordinates.
+private struct LocationPointRow: View {
+    let point: SessionLocationInfo.Point
+
+    private var detail: String {
+        // The date is in the card's header; a row only needs the time.
+        let time = point.time.components(separatedBy: " at ").last ?? point.time
+        guard point.coordinate != nil else { return "\(time) · no location available" }
+        return ([time] + [point.isLastKnown ? "last known position" : nil, point.accuracy].compactMap { $0 }).joined(separator: " · ")
+    }
+
+    var body: some View {
+        if let url = point.mapURL {
+            Link(destination: url) { content(opensMap: true) }
+        } else {
+            content(opensMap: false)
+        }
+    }
+
+    private func content(opensMap: Bool) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(point.label)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(opensMap ? Theme.secondaryText : Theme.warning)
+                    .multilineTextAlignment(.leading)
+            }
+            Spacer(minLength: 8)
+            if opensMap {
+                Image(systemName: "arrow.up.right.square")
+                    .foregroundStyle(Theme.accent)
+            }
+        }
+        .contentShape(.rect)
+    }
+}
+
+/// The system player, used instead of SwiftUI's `VideoPlayer` so the app
+/// controls what happens around full screen. Going full screen covers the
+/// SwiftUI screen underneath, which SwiftUI reports as that screen
+/// disappearing, so playback is stopped here, when the player itself is
+/// torn down, rather than in `onDisappear`.
+struct FullScreenCapablePlayer: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        controller.delegate = context.coordinator
+        controller.view.backgroundColor = .clear
+        return controller
+    }
+
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+        if controller.player !== player {
+            controller.player = player
+        }
+    }
+
+    static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator: Coordinator) {
+        controller.player?.pause()
+    }
+
+    final class Coordinator: NSObject, AVPlayerViewControllerDelegate {
+        func playerViewController(
+            _ playerViewController: AVPlayerViewController,
+            willEndFullScreenPresentationWithAnimationCoordinator coordinator: any UIViewControllerTransitionCoordinator
+        ) {
+            // The system pauses when full screen is closed; carry on playing
+            // if the video was playing.
+            let wasPlaying = (playerViewController.player?.rate ?? 0) > 0
+            coordinator.animate(alongsideTransition: nil) { context in
+                if !context.isCancelled && wasPlaying { playerViewController.player?.play() }
+            }
+        }
+    }
+}
+
 /// List row for a Drive folder, with a badge when it has clips the phone
 /// doesn't.
 struct DriveFolderRow: View {
     let title: String
     let subtitle: String
     let newClipCount: Int
+    /// When set, the row ends with a "more" menu offering to delete the folder.
+    var onDelete: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 14) {
@@ -247,11 +442,9 @@ struct DriveFolderRow: View {
                 Text(title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
-                    .lineLimit(1)
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(Theme.secondaryText)
-                    .lineLimit(1)
             }
             Spacer(minLength: 8)
             if newClipCount > 0 {
@@ -261,6 +454,18 @@ struct DriveFolderRow: View {
                 Image(systemName: "play.circle.fill")
                     .font(.title2)
                     .foregroundStyle(Theme.accent)
+            }
+            if let onDelete {
+                Menu {
+                    Button("Delete from This Phone", systemImage: "trash", role: .destructive, action: onDelete)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(Theme.secondaryText)
+                        .frame(width: 32, height: 44)
+                        .contentShape(.rect)
+                }
+                .accessibilityLabel("More")
             }
         }
         .card(padding: 12)
