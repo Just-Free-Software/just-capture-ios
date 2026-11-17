@@ -97,6 +97,9 @@ struct RecordingView: View {
             guard exceeded, !old else { return }
             handleStorageExceeded()
         }
+        .onChange(of: driveStorageManager.shouldSendLowStorageEmail) { _, shouldSend in
+            if shouldSend { sendStorageLowEmail() }
+        }
         .alert("Google Drive Storage Full", isPresented: $showOutOfStorageAlert, actions: {
             Button("OK", role: .cancel) { }
         }, message: {
@@ -499,20 +502,32 @@ struct RecordingView: View {
     private func handleStorageExceeded() {
         // Show "Drive full" now rather than the last free-space figure.
         driveStorageManager.markOutOfStorage()
-        if let session = sessionStore.currentSession, session.isActive,
-           storageEmailSentForSessionId != session.id {
-            storageEmailSentForSessionId = session.id
-            enqueueStorageFullEmailIfNeeded(for: session)
-        }
+        sendStorageEmailOnce(
+            subject: EmailSettings.storageSubject(name: authManager.userName, email: authManager.userEmail),
+            note: EmailSettings.storageFullNote
+        )
     }
-    
-    private func enqueueStorageFullEmailIfNeeded(for session: RecordingSession) {
+
+    /// Gmail shares the account's storage with Drive, so a full account may not
+    /// be able to send at all. This warning goes out while it still can.
+    private func sendStorageLowEmail() {
+        sendStorageEmailOnce(
+            subject: EmailSettings.storageSubject(name: authManager.userName, email: authManager.userEmail),
+            note: EmailSettings.storageLowNote
+        )
+    }
+
+    /// At most one storage email per recording, low or full.
+    private func sendStorageEmailOnce(subject: String, note: String) {
+        guard let session = sessionStore.currentSession, session.isActive,
+              storageEmailSentForSessionId != session.id else { return }
+        storageEmailSentForSessionId = session.id
         let settings = EmailSettings.current
         guard settings.canSend else { return }
         enqueueEmail(
             for: session,
-            subject: "Storage Full: \(settings.subject)",
-            note: EmailSettings.storageFullNote,
+            subject: subject,
+            note: note,
             settings: settings
         )
     }
@@ -558,6 +573,9 @@ struct RecordingView: View {
             // waits briefly for the folder above so the email carries the link,
             // but goes out without it rather than stall on a bad network.
             enqueueAlertEmailIfNeeded(for: session)
+
+            // Already low, so nothing will change and trigger the warning.
+            if driveStorageManager.shouldSendLowStorageEmail { sendStorageLowEmail() }
     }
 
     /// Records where the session started, whether or not anyone is notified.
@@ -598,7 +616,7 @@ struct RecordingView: View {
         emailQueueManager.enqueue(
             sessionId: session.id,
             recipients: settings.recipients,
-            subject: EmailSettings.personalize(subject, name: authManager.userName, email: authManager.userEmail),
+            subject: EmailSettings.personalize(subject, email: authManager.userEmail),
             bodyNote: note,
             includeTime: settings.includeTime,
             includeLocation: settings.includeLocation,
