@@ -19,7 +19,7 @@ struct VideoPlayerView: View {
                         description: Text("It was removed after uploading. Open the session in Google Drive to watch it.")
                     )
                 } else if let player = player {
-                    VideoPlayer(player: player)
+                    FullScreenCapablePlayer(player: player)
                         .ignoresSafeArea()
                 } else {
                     ProgressView()
@@ -37,13 +37,11 @@ struct VideoPlayerView: View {
                 }
             }
             .onAppear {
-                guard fileExists else { return }
+                // Coming back from full screen appears again; keep the same player.
+                guard fileExists, player == nil else { return }
                 let newPlayer = AVPlayer(url: chunk.localURL)
                 self.player = newPlayer
                 newPlayer.play()
-            }
-            .onDisappear {
-                player?.pause()
             }
         }
     }

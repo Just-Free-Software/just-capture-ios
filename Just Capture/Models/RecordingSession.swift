@@ -65,8 +65,8 @@ class RecordingSession: Identifiable, Codable {
     var driveFolderLink: String?
     /// Whether the Drive folder has been shared with anyone who has the link.
     /// `false` means sharing is still owed and will be retried; `nil` means the
-    /// folder is left private (no one has been notified about this session, the
-    /// session predates sharing, or the account's policy forbids public links).
+    /// folder is left private (no one has been notified about this session, or
+    /// the account's policy forbids public links).
     var driveFolderShared: Bool?
     var locationAddress: String?
     var latitude: Double?

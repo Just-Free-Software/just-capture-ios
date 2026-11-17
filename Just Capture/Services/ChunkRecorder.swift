@@ -163,8 +163,8 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     }
 
     // Lets a crash or kill mid-chunk keep everything up to the last fragment
-    // instead of leaving a file with no index. finishWriting still rewrites
-    // the file as a regular, non-fragmented movie.
+    // instead of leaving a file with no index, which `ClipRecovery` then saves.
+    // finishWriting still rewrites the file as a regular, non-fragmented movie.
     private static let fragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
     // Audio lags video by less than this; past it, a chunk waiting for its
     // last audio is finished anyway.
@@ -191,15 +191,57 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     // long before trying again rather than retrying on every frame.
     private static let prepareRetryDelay = CMTime(seconds: 2, preferredTimescale: 600)
 
+    /// Holds a directory per launch of the app, so `ClipRecovery` can tell a
+    /// clip that was cut off from a writer this launch is still using. Not in
+    /// `tmp`, which iOS can empty before an interrupted clip is recovered.
+    static let stagingRoot: URL = {
+        var url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Recording", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
+        return url
+    }()
+
     /// Where chunks are written until they're finished, independent of the
     /// recording, so a writer can be prepared before recording starts.
     /// Finished chunks are moved to the recording's directory, which is on
     /// the same volume, so the move is a rename.
-    private static let stagingDirectory: URL = {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Recording", isDirectory: true)
+    static let stagingDirectory: URL = {
+        let url = stagingRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
+
+    /// Saved beside a chunk's `.partial` file while it's recorded, saying where
+    /// the footage belongs if the app dies before the chunk is finished.
+    struct ClipMarker: Codable, Sendable {
+        let sessionId: String
+        let index: Int
+    }
+    static let markerExtension = "marker"
+
+    private func markerURL(for segment: Segment) -> URL {
+        segment.url.deletingPathExtension().appendingPathExtension(Self.markerExtension)
+    }
+
+    /// On `finishQueue`, as disk writes on `queue` can make the camera drop a
+    /// frame. The same queue removes it, so the order is kept.
+    private func writeMarker(for segment: Segment) {
+        let marker = ClipMarker(sessionId: segment.outputDirectory.lastPathComponent, index: segment.index)
+        let url = markerURL(for: segment)
+        finishQueue.async {
+            if let data = try? JSONEncoder().encode(marker) {
+                try? data.write(to: url)
+            }
+        }
+    }
+
+    private func removeMarker(for segment: Segment) {
+        let url = markerURL(for: segment)
+        finishQueue.async { try? FileManager.default.removeItem(at: url) }
+    }
 
     /// Builds the next chunk's writer ahead of the cut. Creating a writer and
     /// its encoder takes long enough that doing it on `queue` at the cut makes
@@ -233,6 +275,10 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
     /// audio up to that point.
     private var draining: Segment?
     private var cutRequested = false
+    /// The microphone came back during a chunk with no audio track. That
+    /// chunk is cut as soon as a writer with one is ready, so sound doesn't
+    /// wait for the next regular cut.
+    private var cutWhenWriterReady = false
     private var previousVideoTime: CMTime = .invalid
     /// The longest any video frame has taken to reach us after capture.
     /// The delay dips briefly when the camera drops frames to catch up; the
@@ -261,6 +307,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         nonisolated(unsafe) let video = video
         nonisolated(unsafe) let audio = audio
         queue.async {
+            let micChanged = (audio == nil) != (self.audioSettings == nil)
             self.videoSettings = video
             self.audioSettings = audio
             self.settingsGeneration += 1
@@ -269,9 +316,15 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             // camera's last ~1.6 s of frames are still being encoded, and
             // tearing down one encoder and starting another then stalls the
             // current one (~0.7 s of frames lost on an iPhone 17). When idle,
-            // the next frame prepares a matching writer.
-            if !self.isActive {
+            // the next frame prepares a matching writer. The microphone
+            // coming or going isn't a flip: the capture session has just
+            // reconfigured anyway, and the next chunk needs a different
+            // writer, so it's replaced now to be ready by the cut.
+            if !self.isActive || micChanged {
                 self.discardPrepared()
+            }
+            if micChanged {
+                self.cutWhenWriterReady = self.isActive && audio != nil && self.current?.audioInput == nil
             }
         }
     }
@@ -292,6 +345,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             self.nextIndexToReport = 0
             self.finishedChunks = [:]
             self.cutRequested = false
+            self.cutWhenWriterReady = false
             self.previousVideoTime = .invalid
             self.isStopping = false
             self.generation += 1
@@ -376,6 +430,11 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             return
         }
 
+        if cutWhenWriterReady, let prepared, prepared.matches(dimensions, settingsGeneration: settingsGeneration) {
+            cutWhenWriterReady = false
+            cutRequested = true
+        }
+
         if let segment = current {
             // A camera flip can change the frame size; a writer is set up for
             // one size, so that also starts a new chunk.
@@ -402,6 +461,9 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             : CMTime(value: 1, timescale: 30)
         previousVideoTime = time
         segment.lastVideoEnd = CMTimeAdd(time, frameDuration)
+
+        // The microphone coming or going discards the prepared writer.
+        prepareNextWriter(dimensions: dimensions)
 
         // Taking video is what lets a writer take more audio.
         writePendingAudio(for: segment)
@@ -445,7 +507,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         segment.queuedAudioEnd = end
         if segment.pendingAudio.count > Self.maxPendingAudioBuffers {
             segment.pendingAudio.removeFirst()
-            print("⚠️ Chunk \(segment.index + 1): writer isn't taking audio; dropped a buffer")
+            print("Chunk \(segment.index + 1): writer isn't taking audio; dropped a buffer")
         }
         writePendingAudio(for: segment)
     }
@@ -507,6 +569,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         let segment = Segment(ready, index: index, startTime: time, outputDirectory: directory)
         current = segment
         nextChunkIndex += 1
+        writeMarker(for: segment)
         for buffer in recentAudio {
             append(audio: buffer, to: segment)
         }
@@ -616,7 +679,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         let end = segment.endTime ?? segment.lastVideoEnd
         let duration = max(CMTimeSubtract(end, segment.startTime).seconds, 0.01)
         if !segment.drops.isEmpty {
-            print("⚠️ Chunk \(segment.index + 1) (\(String(format: "%.2f", duration)) s): \(segment.drops.summary)")
+            print("Chunk \(segment.index + 1) (\(String(format: "%.2f", duration)) s): \(segment.drops.summary)")
         }
         finishingCount += 1
         // The segment is no longer current or draining, so nothing on
@@ -636,7 +699,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
             }
         }
         if !segment.pendingAudio.isEmpty {
-            print("⚠️ Chunk \(segment.index + 1): \(segment.pendingAudio.count) audio buffers never written")
+            print("Chunk \(segment.index + 1): \(segment.pendingAudio.count) audio buffers never written")
         }
         segment.videoInput.markAsFinished()
         segment.audioInput?.markAsFinished()
@@ -658,6 +721,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
                     try? FileManager.default.removeItem(at: segment.url)
                     result = RecordedChunk(index: segment.index, url: finalURL, duration: duration, fileSize: 0, errorDescription: error.localizedDescription)
                 }
+                self.removeMarker(for: segment)
                 self.report(result)
             }
         }
@@ -669,6 +733,7 @@ nonisolated final class ChunkRecorder: NSObject, @unchecked Sendable {
         let message = segment.writer.error?.localizedDescription ?? "The camera stopped recording unexpectedly."
         segment.writer.cancelWriting()
         try? FileManager.default.removeItem(at: segment.url)
+        removeMarker(for: segment)
         if current === segment { current = nil }
         if draining === segment { draining = nil }
         isActive = false

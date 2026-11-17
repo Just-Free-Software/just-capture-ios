@@ -17,7 +17,23 @@ class UploadQueueManager {
     /// Called after each chunk lands in Drive, so the storage figure can be
     /// updated without waiting for a quota refresh.
     var onChunkUploaded: ((VideoChunk) -> Void)?
+    /// Called when clips stop being held by iOS and need the app again, so a
+    /// wake-up can be queued if the phone is about to be left alone.
+    var onWorkChanged: (() -> Void)?
+    /// Runs the actual uploads, so they carry on when the app isn't running.
+    var transfers: BackgroundTransfers?
+    weak var authManager: GoogleAuthManager?
+    /// Clips the app is working on: getting an upload link, or waiting to retry.
     private var uploadTasks: [UUID: Task<Void, Never>] = [:]
+    /// Clips iOS is holding. It may still be waiting for a connection.
+    private var liveUploads: Set<UUID> = []
+    /// Non-nil while asking iOS which uploads it holds.
+    private var finishedWhileReconnecting: Set<UUID>?
+    /// Clips being deleted, whose cancelled uploads shouldn't be retried.
+    private var cancelledUploads: Set<UUID> = []
+    /// Sessions with a `prepareFolder` loop running, so repeated calls don't
+    /// each start their own.
+    private var folderPreparers: Set<String> = []
     /// One in-flight Drive folder creation per session. Without this, the
     /// recording start and the first chunk uploads each create their own
     /// folder and the session's clips end up split across several folders.
@@ -192,12 +208,18 @@ class UploadQueueManager {
     /// carry the link), retrying with backoff. Failures are non-fatal — the
     /// first chunk upload will try again.
     func prepareFolder(for session: RecordingSession, authManager: GoogleAuthManager) {
+        guard session.driveFolderId == nil, folderPreparers.insert(session.id).inserted else { return }
         Task { @MainActor in
+            defer { folderPreparers.remove(session.id) }
             var attempt = 0
             while session.driveFolderId == nil {
                 do {
                     _ = try await ensureFolder(for: session, authManager: authManager)
                 } catch {
+                    if RetryPolicy.isOffline(error) {
+                        await NetworkMonitor.shared.waitForRestoredConnection(upTo: RetryPolicy.maxDelay)
+                        continue
+                    }
                     attempt += 1
                     if attempt >= RetryPolicy.maxAttempts {
                         print("Failed to create Drive folder after \(attempt) attempts: \(error.localizedDescription)")
@@ -205,20 +227,27 @@ class UploadQueueManager {
                     }
                     let delay = RetryPolicy.delay(forAttempt: attempt)
                     print("Drive folder attempt \(attempt) failed, retrying in \(Int(delay))s: \(error.localizedDescription)")
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    await NetworkMonitor.shared.waitForRestoredConnection(upTo: delay)
                 }
             }
         }
     }
-    
-    func enqueue(chunk: VideoChunk, session: RecordingSession, authManager: GoogleAuthManager) {
+
+    /// Gets a clip to where iOS is uploading it. The app only has to get an
+    /// upload link, which needs a connection and a token; once it has one, the
+    /// clip no longer depends on the app running. `delay` is backoff owed from
+    /// a background upload that failed.
+    func enqueue(chunk: VideoChunk, session: RecordingSession, authManager: GoogleAuthManager, after delay: TimeInterval = 0) {
+        guard !liveUploads.contains(chunk.id) else { return }
         uploadTasks[chunk.id]?.cancel()
         chunk.status = .pending
         chunk.uploadProgress = 0
         let task = Task { @MainActor in
             let background = BackgroundActivity(name: "Upload chunk")
             defer { background.end() }
-            var attempt = 0
+            if delay > 0 {
+                await NetworkMonitor.shared.waitForRestoredConnection(upTo: delay)
+            }
             var quotaAttempt = 0
             while true {
                 guard !Task.isCancelled else { return }
@@ -227,30 +256,20 @@ class UploadQueueManager {
                     releaseUploadSlot()
                     return
                 }
-                chunk.status = .uploading
                 do {
-                    let fileId: String
+                    let alreadyUploaded: String?
                     do {
                         defer { releaseUploadSlot() }
-                        let folderId = try await ensureFolder(for: session, authManager: authManager)
-                        let token = try await authManager.validAccessToken()
-                        fileId = try await GoogleDriveService.uploadFile(localURL: chunk.localURL, fileName: chunk.fileName, folderId: folderId, accessToken: token) { progress in
-                            Task { @MainActor in
-                                chunk.uploadProgress = progress
-                            }
-                        }
+                        alreadyUploaded = try await handOffToBackgroundSession(chunk: chunk, session: session, authManager: authManager)
                     }
-                    
-                    chunk.status = .uploaded
-                    chunk.driveFileId = fileId
-                    storageExceeded = false
-                    sessionStore?.save()
-                    onChunkUploaded?(chunk)
-                    
+                    guard !Task.isCancelled else { return }
                     uploadTasks.removeValue(forKey: chunk.id)
-                    await updatePlaylist(session: session, authManager: authManager)
+                    if let alreadyUploaded {
+                        await completeUpload(of: chunk, in: session, fileId: alreadyUploaded, authManager: authManager)
+                    }
                     return
                 } catch {
+                    guard !Task.isCancelled else { return }
                     if case DriveError.storageQuotaExceeded = error {
                         // Recording keeps going; the chunk stays queued. Freeing
                         // space usually needs the user to act, so back off
@@ -263,7 +282,7 @@ class UploadQueueManager {
                         sessionStore?.save()
                         quotaAttempt += 1
                         let delay = Self.storageRetryDelay(forQuotaAttempt: quotaAttempt)
-                        print("🛑 Chunk \(chunk.index + 1) can't upload: Google Drive storage is full. Re-checking in \(Int(delay / 60)) min.")
+                        print("Chunk \(chunk.index + 1) can't upload: Google Drive storage is full. Re-checking in \(Int(delay / 60)) min.")
                         while true {
                             guard !Task.isCancelled else { return }
                             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -283,50 +302,224 @@ class UploadQueueManager {
                         }
                         continue
                     }
-                    attempt += 1
-                    if attempt >= RetryPolicy.maxAttempts {
-                        chunk.status = .failed
+                    if RetryPolicy.isOffline(error) {
+                        // Doesn't use up a try. The wake-up request gets the
+                        // app running again if iOS suspends it during this.
+                        chunk.status = .pending
                         chunk.uploadProgress = 0
-                        sessionStore?.save()
-                        print("🛑 Chunk \(chunk.index + 1) failed after \(attempt) attempts: \(error.localizedDescription)")
+                        print("Chunk \(chunk.index + 1) is waiting for a connection.")
+                        onWorkChanged?()
+                        await NetworkMonitor.shared.waitForRestoredConnection(upTo: RetryPolicy.maxDelay)
+                        continue
+                    }
+                    let attempt = recordFailedAttempt(for: chunk)
+                    guard attempt < RetryPolicy.maxAttempts else {
+                        markFailed(chunk, after: attempt, error: error.localizedDescription)
                         uploadTasks.removeValue(forKey: chunk.id)
+                        onWorkChanged?()
                         return
                     }
                     chunk.status = .pending
                     chunk.uploadProgress = 0
                     let delay = RetryPolicy.delay(forAttempt: attempt)
-                    print("📤 Upload attempt \(attempt) for chunk \(chunk.index + 1) failed, retrying in \(Int(delay))s: \(error.localizedDescription)")
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    print("Upload attempt \(attempt) for chunk \(chunk.index + 1) failed, retrying in \(Int(delay))s: \(error.localizedDescription)")
+                    await NetworkMonitor.shared.waitForRestoredConnection(upTo: delay)
                 }
             }
         }
         uploadTasks[chunk.id] = task
     }
-    
+
+    /// Starts the background upload, continuing an earlier one if there is one.
+    /// Returns the file's id if Drive turns out to have the whole clip already.
+    private func handOffToBackgroundSession(chunk: VideoChunk, session: RecordingSession, authManager: GoogleAuthManager) async throws -> String? {
+        guard let transfers else { throw URLError(.cannotConnectToHost) }
+        let folderId = try await ensureFolder(for: session, authManager: authManager)
+        let attributes = try FileManager.default.attributesOfItem(atPath: chunk.localURL.path)
+        let fileSize = (attributes[.size] as? Int64) ?? chunk.fileSize
+
+        var offset: Int64 = 0
+        if let existing = chunk.uploadSessionURL {
+            switch try await GoogleDriveService.resumableUploadState(sessionURL: existing, fileSize: fileSize) {
+            case .complete(let fileId):
+                return fileId
+            case .incomplete(let nextOffset):
+                offset = nextOffset
+            case .expired:
+                chunk.uploadSessionURL = nil
+            }
+        }
+        let sessionURL: URL
+        if let existing = chunk.uploadSessionURL {
+            sessionURL = existing
+        } else {
+            let token = try await authManager.validAccessToken()
+            sessionURL = try await GoogleDriveService.createUploadSession(fileName: chunk.fileName, fileSize: fileSize, folderId: folderId, accessToken: token)
+            chunk.uploadSessionURL = sessionURL
+            sessionStore?.save()
+        }
+        try Task.checkCancellation()
+
+        let fileURL = offset > 0
+            ? try Self.writeRemainder(of: chunk, from: offset)
+            : chunk.localURL
+        transfers.startUpload(chunkId: chunk.id, fileURL: fileURL, sessionURL: sessionURL, offset: offset, fileSize: fileSize)
+        liveUploads.insert(chunk.id)
+        // Stays "Queued" until bytes actually move, which may be much later.
+        chunk.uploadProgress = fileSize > 0 ? Double(offset) / Double(fileSize) : 0
+        return nil
+    }
+
+    /// Background uploads must come from a file, so continuing partway through
+    /// a clip needs a file holding just the part Drive doesn't have.
+    private static func writeRemainder(of chunk: VideoChunk, from offset: Int64) throws -> URL {
+        let url = remainderURL(for: chunk.id)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let handle = try FileHandle(forReadingFrom: chunk.localURL)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(offset))
+        let remainder = try handle.readToEnd() ?? Data()
+        try remainder.write(to: url, options: .atomic)
+        return url
+    }
+
+    private static func remainderURL(for chunkId: UUID) -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("UploadRemainders/\(chunkId.uuidString)")
+    }
+
+    private func recordFailedAttempt(for chunk: VideoChunk) -> Int {
+        let attempt = (chunk.uploadAttempts ?? 0) + 1
+        chunk.uploadAttempts = attempt
+        sessionStore?.save()
+        return attempt
+    }
+
+    private func markFailed(_ chunk: VideoChunk, after attempt: Int, error: String) {
+        chunk.status = .failed
+        chunk.uploadProgress = 0
+        sessionStore?.save()
+        print("Chunk \(chunk.index + 1) failed after \(attempt) attempts: \(error)")
+    }
+
+    private func completeUpload(of chunk: VideoChunk, in session: RecordingSession, fileId: String, authManager: GoogleAuthManager) async {
+        chunk.status = .uploaded
+        chunk.driveFileId = fileId
+        chunk.uploadProgress = 1
+        chunk.uploadSessionURL = nil
+        chunk.uploadAttempts = nil
+        storageExceeded = false
+        sessionStore?.save()
+        onChunkUploaded?(chunk)
+        await updatePlaylist(session: session, authManager: authManager)
+    }
+
+    private func findChunk(id: UUID) -> (chunk: VideoChunk, session: RecordingSession)? {
+        for session in sessionStore?.sessions ?? [] {
+            if let chunk = session.chunks.first(where: { $0.id == id }) { return (chunk, session) }
+        }
+        return nil
+    }
+
+    func handleUploadProgress(chunkId: UUID, fraction: Double) {
+        guard let chunk = findChunk(id: chunkId)?.chunk, chunk.status != .uploaded else { return }
+        chunk.status = .uploading
+        chunk.uploadProgress = fraction
+    }
+
+    /// iOS has finished with a clip. This can arrive long after the upload
+    /// began, in a later launch of the app. It can also repeat something the
+    /// app already worked out for itself, so a clip marked uploaded is left alone.
+    func handleUploadFinished(_ finished: FinishedBackgroundUpload) {
+        liveUploads.remove(finished.chunkId)
+        finishedWhileReconnecting?.insert(finished.chunkId)
+        try? FileManager.default.removeItem(at: Self.remainderURL(for: finished.chunkId))
+        if cancelledUploads.remove(finished.chunkId) != nil { return }
+        guard let (chunk, session) = findChunk(id: finished.chunkId), chunk.status != .uploaded, let authManager else { return }
+        defer { onWorkChanged?() }
+
+        if let status = finished.statusCode, (200...299).contains(status),
+           let fileId = GoogleDriveService.uploadedFileId(from: finished.body) {
+            Task { await completeUpload(of: chunk, in: session, fileId: fileId, authManager: authManager) }
+            return
+        }
+        // A force-quit cancels uploads. Nothing went wrong with the clip, and
+        // the next attempt asks Drive how much of it arrived.
+        if finished.wasCancelled {
+            enqueue(chunk: chunk, session: session, authManager: authManager)
+            return
+        }
+        if let status = finished.statusCode, (try? GoogleDriveService.throwIfQuotaExceeded(data: finished.body, statusCode: status)) == nil {
+            storageExceeded = true
+            sessionStore?.save()
+            enqueue(chunk: chunk, session: session, authManager: authManager, after: Self.storageRetryInitialDelay)
+            return
+        }
+        // A reply with no connection problem behind it still counts, so a
+        // permanent rejection can't turn into a loop of full uploads.
+        let reason = finished.error?.localizedDescription ?? "HTTP \(finished.statusCode ?? 0)"
+        if finished.statusCode == nil, let error = finished.error, RetryPolicy.isOffline(error) {
+            enqueue(chunk: chunk, session: session, authManager: authManager)
+            return
+        }
+        let attempt = recordFailedAttempt(for: chunk)
+        guard attempt < RetryPolicy.maxAttempts else {
+            markFailed(chunk, after: attempt, error: reason)
+            return
+        }
+        let delay = RetryPolicy.delay(forAttempt: attempt)
+        print("Background upload of chunk \(chunk.index + 1) failed, retrying in \(Int(delay))s: \(reason)")
+        enqueue(chunk: chunk, session: session, authManager: authManager, after: delay)
+    }
+
+    /// Learns which clips iOS kept hold of while the app wasn't running. Must
+    /// finish before the first sweep, which would otherwise upload them again.
+    func reconnectBackgroundUploads() async {
+        guard let transfers else { return }
+        finishedWhileReconnecting = []
+        let live = await transfers.liveUploadIDs()
+        // One may have finished after that list was made. Counting it as live
+        // would leave it waiting on an upload that's already over.
+        liveUploads.formUnion(live.subtracting(finishedWhileReconnecting ?? []))
+        finishedWhileReconnecting = nil
+    }
+
     func retryChunk(_ chunk: VideoChunk, session: RecordingSession, authManager: GoogleAuthManager) {
+        chunk.uploadAttempts = nil
         enqueue(chunk: chunk, session: session, authManager: authManager)
     }
-    
+
     /// Cancels every in-flight upload belonging to a session. Used when the
     /// session is being deleted so a late upload can't resurrect it.
     func cancelUploads(for session: RecordingSession) {
+        var live: Set<UUID> = []
         for chunk in session.chunks {
             uploadTasks[chunk.id]?.cancel()
             uploadTasks.removeValue(forKey: chunk.id)
+            if liveUploads.remove(chunk.id) != nil { live.insert(chunk.id) }
         }
+        guard !live.isEmpty, let transfers else { return }
+        cancelledUploads.formUnion(live)
+        Task { await transfers.cancelUploads(chunkIds: live) }
     }
-    
-    /// On app launch, re-enqueue every chunk that wasn't confirmed uploaded so
-    /// a backgrounding/kill mid-outage doesn't permanently strand uploads.
-    /// Chunks whose local file is already gone (e.g. `.uploaded` after a
+
+    /// Sweeps up every chunk that wasn't confirmed uploaded and that neither the
+    /// app nor iOS is working on, so a kill or outage can't strand it. Chunks
+    /// whose local file is already gone (e.g. `.uploaded` after a
     /// save-Chunks-locally-off clean-up) are skipped; `.pending`/`.uploading`
     /// chunks with no file are marked `.failed` so the user sees the truth.
-    func resumePendingUploads(authManager: GoogleAuthManager) {
+    /// `retryFailed` also gives clips that ran out of tries a fresh set, and
+    /// retries location files. The caller limits how often that happens.
+    func resumePendingUploads(authManager: GoogleAuthManager, retryFailed: Bool) {
         guard let sessions = sessionStore?.sessions else { return }
         var changed = false
         for session in sessions {
-            for chunk in session.chunks where chunk.status != .uploaded && uploadTasks[chunk.id] == nil {
+            for chunk in session.chunks where chunk.status != .uploaded && uploadTasks[chunk.id] == nil && !liveUploads.contains(chunk.id) {
                 if FileManager.default.fileExists(atPath: chunk.localURL.path) {
+                    if chunk.status == .failed {
+                        guard retryFailed else { continue }
+                        chunk.uploadAttempts = nil
+                    }
                     enqueue(chunk: chunk, session: session, authManager: authManager)
                 } else if chunk.status == .pending || chunk.status == .uploading {
                     chunk.status = .failed
@@ -335,10 +528,31 @@ class UploadQueueManager {
             }
         }
         if changed { sessionStore?.save() }
+        guard retryFailed else { return }
         // Clips may all be up already, leaving nothing else to retry this.
         for session in sessions where session.locationText != session.uploadedLocationText {
             Task { await updateLocationFile(session: session, authManager: authManager) }
         }
+    }
+
+    /// The app is working on something right now.
+    var hasActiveWork: Bool {
+        !uploadTasks.isEmpty || !playlistTasks.isEmpty
+    }
+
+    /// Clips that need the app to run before they can upload.
+    var hasClipsNeedingApp: Bool {
+        (sessionStore?.sessions ?? []).contains { session in
+            session.chunks.contains { chunk in
+                chunk.status != .uploaded && !liveUploads.contains(chunk.id)
+                    && FileManager.default.fileExists(atPath: chunk.localURL.path)
+            }
+        }
+    }
+
+    /// Clips not yet on Drive, including those iOS is holding.
+    var hasUnfinishedClips: Bool {
+        hasClipsNeedingApp || !liveUploads.isEmpty
     }
 
     /// Rewrites the session's playlist on Drive. Calls for the same session

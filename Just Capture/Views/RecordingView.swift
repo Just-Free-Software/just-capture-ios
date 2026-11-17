@@ -11,9 +11,12 @@ struct RecordingView: View {
     @Environment(EmailQueueManager.self) var emailQueueManager
     @Environment(\.openURL) private var openURL
     
+    /// Opens the Settings tab at the setting a readiness pill stands for.
+    var openSettings: (SettingsSection) -> Void = { _ in }
+    
     @AppStorage("emailAlertsEnabled") private var emailAlertsEnabled: Bool = true
     @AppStorage("emailRecipients") private var emailRecipients: String = ""
-    @AppStorage("includeLocationInEmail") private var includeLocationInEmail: Bool = true
+    @AppStorage("locationEnabled") private var locationEnabled: Bool = true
     @AppStorage("chunkDuration") private var chunkDuration: Double = 30
     @State private var showLowStorageConfirm = false
     @State private var deviceFreeBytes: Int64?
@@ -57,6 +60,7 @@ struct RecordingView: View {
                 topBar
                 banners
                 Spacer()
+                callNotice
                 bottomControls
             }
             .padding(.horizontal, 16)
@@ -77,18 +81,20 @@ struct RecordingView: View {
             .animation(.snappy, value: cameraManager.recordingError)
             .animation(.snappy, value: uploadManager.storageExceeded)
             .animation(.snappy, value: isDeviceStorageLow)
+            .animation(.snappy, value: cameraManager.isCallRinging)
+            .animation(.snappy, value: cameraManager.isMicPaused)
         }
         .task {
             // Local filesystem query only (no network), re-checked so the
             // warning appears if the phone fills up mid-recording.
             while !Task.isCancelled {
-                deviceFreeBytes = DeviceStorage.availableBytes()
+                deviceFreeBytes = await DeviceStorage.availableBytes()
                 try? await Task.sleep(for: .seconds(30))
             }
         }
         .onAppear {
             cameraManager.setupSession()
-            if includeLocationInEmail {
+            if locationEnabled {
                 locationManager.requestPermission()
             }
             Task { await driveStorageManager.refreshIfStale(authManager: authManager) }
@@ -120,53 +126,103 @@ struct RecordingView: View {
     @ViewBuilder
     private var topBar: some View {
         if cameraManager.isRecording {
-            HStack(spacing: 8) {
+            VStack(spacing: 8) {
                 HStack(spacing: 8) {
-                    PulseIndicator()
-                    Text(Formatters.duration(cameraManager.elapsedTime))
-                        .font(.system(.headline, design: .monospaced).weight(.semibold))
-                        .foregroundStyle(.white)
-                        .contentTransition(.numericText())
+                    HStack(spacing: 8) {
+                        PulseIndicator()
+                        Text(Formatters.duration(cameraManager.elapsedTime))
+                            .font(.system(.headline, design: .monospaced).weight(.semibold))
+                            .foregroundStyle(.white)
+                            .contentTransition(.numericText())
+                    }
+                    .overlayPill()
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Recording, \(Formatters.duration(cameraManager.elapsedTime))")
+                
+                    Spacer()
+                
+                    if let session = liveSession {
+                        uploadPill(for: session)
+                    }
                 }
-                .overlayPill()
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Recording, \(Formatters.duration(cameraManager.elapsedTime))")
-                
-                Spacer()
-                
-                if let session = liveSession {
-                    uploadPill(for: session)
+                // The notification's progress, under the timer where the
+                // readiness lines were before recording started.
+                if let job = liveEmailJob {
+                    emailStatusLine(job)
                 }
             }
             .transition(.move(edge: .top).combined(with: .opacity))
         } else {
-            HStack(spacing: 8) {
-                readinessPill(
-                    systemImage: recipientCount > 0 ? "envelope.fill" : "envelope.badge.shield.half.filled",
-                    text: recipientCount > 0 ? "\(recipientCount) contact\(recipientCount == 1 ? "" : "s")" : "No contacts",
-                    color: recipientCount > 0 ? .white : Theme.warning
-                )
-                readinessPill(systemImage: "externaldrive.fill", text: driveStorageText, color: driveStorageColor)
-                if isDeviceStorageLow {
-                    readinessPill(systemImage: "iphone.gen3", text: "iPhone low", color: Theme.warning)
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    readinessPill(
+                        systemImage: "externaldrive.fill",
+                        text: driveStorageText,
+                        color: driveStorageColor,
+                        accessibilityLabel: driveStorageAccessibilityLabel,
+                        section: .storage
+                    )
+                    readinessPill(
+                        systemImage: "iphone.gen3",
+                        text: deviceFreeBytes.map(shortGigabytes) ?? "–",
+                        color: isDeviceStorageLow ? Theme.warning : .white,
+                        accessibilityLabel: deviceStorageAccessibilityLabel,
+                        section: .storage
+                    )
+                    readinessPill(
+                        systemImage: "location.fill",
+                        trailingSystemImage: locationWillBeSaved ? "checkmark" : "xmark",
+                        // Red only when the setting is on but iOS permission is
+                        // missing; switched off on purpose isn't a problem.
+                        color: locationWillBeSaved ? .white : (locationEnabled ? Theme.record : Theme.secondaryText),
+                        accessibilityLabel: locationWillBeSaved ? "Location will be saved" : (locationEnabled ? "Location permission is off" : "Location won't be saved"),
+                        section: .location
+                    )
                 }
-                readinessPill(
-                    systemImage: locationAuthorized ? "location.fill" : "location.slash.fill",
-                    text: locationAuthorized ? "Location" : "No location",
-                    color: locationAuthorized ? .white : Theme.record
-                )
+                VStack(spacing: 2) {
+                    Text("Recording in \(Int(chunkDuration))-second clips")
+                        .foregroundStyle(Theme.secondaryText)
+                    Text(recipientCount > 0 ? "Ready to email \(recipientCount) contact\(recipientCount == 1 ? "" : "s")" : "No contacts to email")
+                        // Yellow only when notifications are on with nobody to
+                        // send to; switching them off is a choice.
+                        .foregroundStyle(recipientCount == 0 && emailAlertsEnabled ? Theme.warning : Theme.secondaryText)
+                }
+                .font(.footnote.weight(.medium))
             }
             .frame(maxWidth: .infinity)
             .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
     
-    private func readinessPill(systemImage: String, text: String, color: Color) -> some View {
-        Label(text, systemImage: systemImage)
+    private func readinessPill(
+        systemImage: String,
+        text: String? = nil,
+        trailingSystemImage: String? = nil,
+        color: Color,
+        accessibilityLabel: String,
+        section: SettingsSection
+    ) -> some View {
+        Button {
+            openSettings(section)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                if let text {
+                    Text(text).monospacedDigit()
+                }
+                if let trailingSystemImage {
+                    Image(systemName: trailingSystemImage)
+                }
+            }
             .font(.caption.weight(.semibold))
             .foregroundStyle(color)
             .lineLimit(1)
             .overlayPill()
+            .contentShape(.capsule)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityHint("Opens this setting")
     }
     
     private func uploadPill(for session: RecordingSession) -> some View {
@@ -183,15 +239,42 @@ struct RecordingView: View {
         .accessibilityLabel("\(session.uploadedCount) of \(session.totalCount) clips uploaded")
     }
     
+    /// Free Drive space as a short "12 GB"; the pill's color carries low and full.
     private var driveStorageText: String {
         switch driveStorageManager.state {
-        case .ok: return driveStorageManager.availableBytes.map { DriveStorageManager.formatBytes($0) } ?? "Drive"
-        case .low: return "Drive low"
-        case .out: return "Drive full"
-        case .unlimited: return "Unlimited"
-        case .unavailable: return "Drive"
+        case .ok, .low:
+            return driveStorageManager.availableBytes.map(shortGigabytes) ?? "–"
+        case .out: return "0 GB"
+        case .unlimited: return "∞"
+        case .unavailable: return "–"
         }
     }
+    
+    private func shortGigabytes(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / 1_073_741_824
+        return gb >= 10 ? "\(Int(gb)) GB" : String(format: "%.1f GB", gb)
+    }
+    
+    private var deviceStorageAccessibilityLabel: String {
+        guard let deviceFreeBytes else { return "iPhone storage unknown" }
+        let free = shortGigabytes(deviceFreeBytes)
+        return isDeviceStorageLow ? "iPhone storage is low, \(free) free" : "iPhone, \(free) free"
+    }
+    
+    private var locationWillBeSaved: Bool {
+        locationEnabled && locationAuthorized
+    }
+    
+    private var driveStorageAccessibilityLabel: String {
+        switch driveStorageManager.state {
+        case .ok: return "Google Drive, \(driveStorageText) free"
+        case .low: return "Google Drive is low, \(driveStorageText) free"
+        case .out: return "Google Drive is full"
+        case .unlimited: return "Google Drive, unlimited storage"
+        case .unavailable: return "Google Drive storage unknown"
+        }
+    }
+    
     
     private var isDeviceStorageLow: Bool {
         guard let deviceFreeBytes else { return false }
@@ -250,7 +333,7 @@ struct RecordingView: View {
             )
             .transition(.move(edge: .top).combined(with: .opacity))
         }
-        if !cameraManager.isRecording && includeLocationInEmail && !locationAuthorized && locationManager.authorizationStatus != .notDetermined {
+        if !cameraManager.isRecording && locationEnabled && !locationAuthorized && locationManager.authorizationStatus != .notDetermined {
             NoticeBanner(
                 style: .info,
                 systemImage: "location.slash.fill",
@@ -262,6 +345,31 @@ struct RecordingView: View {
         }
     }
     
+    /// Sits low on the screen because the system's call banner covers the top.
+    /// The padding clears the send clip button floating above the controls.
+    @ViewBuilder
+    private var callNotice: some View {
+        Group {
+            if cameraManager.isRecording && cameraManager.isCallRinging {
+                NoticeBanner(
+                    style: .warning,
+                    systemImage: "phone.arrow.down.left.fill",
+                    title: "Answering switches the mic to your call",
+                    message: "Video keeps recording without sound until you hang up, as long as you stay in this app."
+                )
+            } else if cameraManager.isMicPaused {
+                NoticeBanner(
+                    style: .warning,
+                    systemImage: "mic.slash.fill",
+                    title: cameraManager.isRecording ? "Recording without sound" : "Mic is in use",
+                    message: "A call or another app is using the mic. Video still records, and sound comes back when the mic is free."
+                )
+            }
+        }
+        .padding(.bottom, 60)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
     private var cameraPermissionPlaceholder: some View {
         VStack(spacing: 16) {
             Image(systemName: "video.slash.fill")
@@ -291,19 +399,6 @@ struct RecordingView: View {
     
     private var bottomControls: some View {
         VStack(spacing: 18) {
-            if cameraManager.isRecording {
-                VStack(spacing: 10) {
-                    if let job = liveEmailJob {
-                        emailStatusLine(job)
-                    }
-                }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else {
-                Text("Recording in \(Int(chunkDuration))-second clips")
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(Theme.secondaryText)
-            }
-            
             HStack {
                 circleControl(
                     systemImage: cameraManager.isTorchOn ? "flashlight.on.fill" : "flashlight.off.fill",
@@ -540,11 +635,11 @@ struct RecordingView: View {
             let session = RecordingSession(chunkDuration: duration)
             sessionStore.add(session)
             
-            let savesLocation = includeLocationInEmail
+            let savesLocation = locationEnabled
             cameraManager.onChunkCompleted = { chunk in
                 session.chunks.append(chunk)
                 // Saved before the upload below, which also sends the trail to Drive.
-                if savesLocation, EmailSettings.current.includeLocation, locationManager.isAuthorized {
+                if savesLocation, EmailSettings.current.locationEnabled, locationManager.isAuthorized {
                     session.addClipToTrail(locationManager.lastKnownFix, clipFileName: chunk.fileName)
                 }
                 sessionStore.save()
@@ -605,7 +700,7 @@ struct RecordingView: View {
     private func enqueueAlertEmailIfNeeded(for session: RecordingSession) {
         let settings = EmailSettings.current
         guard settings.canSend else {
-            print("ℹ️ Email alerts are disabled or have no recipients.")
+            print("Email alerts are disabled or have no recipients.")
             return
         }
         enqueueEmail(for: session, subject: settings.subject, note: settings.note, settings: settings)
@@ -616,10 +711,10 @@ struct RecordingView: View {
         emailQueueManager.enqueue(
             sessionId: session.id,
             recipients: settings.recipients,
-            subject: EmailSettings.personalize(subject, email: authManager.userEmail),
+            subject: subject,
             bodyNote: note,
             includeTime: settings.includeTime,
-            includeLocation: settings.includeLocation,
+            includeLocation: settings.locationEnabled,
             authManager: authManager
         )
     }

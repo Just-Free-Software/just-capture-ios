@@ -12,7 +12,7 @@ enum GmailService {
             bodyNote: bodyNote
         )
         
-        let htmlBase64 = html.data(using: .utf8)?.base64EncodedString(options: .lineLength76Characters) ?? ""
+        let htmlBase64 = html.data(using: .utf8)?.base64EncodedString(options: [.lineLength76Characters, .endLineWithLineFeed]) ?? ""
         // Strip CR/LF so user-entered values can't break out of their header.
         let to = recipients.map { $0.replacingOccurrences(of: "[\\r\\n]", with: "", options: .regularExpression) }.joined(separator: ", ")
         let subjectBase64 = subject.data(using: .utf8)?.base64EncodedString() ?? ""
@@ -53,7 +53,7 @@ enum GmailService {
             throw URLError(.badServerResponse)
         }
         
-        print("✅ Email sent successfully to \(recipients.joined(separator: ", "))!")
+        print("Email sent successfully to \(recipients.joined(separator: ", "))!")
     }
     
     // TODO: Replace with the real App Store link once the app is listed.
@@ -81,10 +81,8 @@ enum GmailService {
             let timeString = timestampFormatter.string(from: startedAt)
             let timeHtml = "<p>Recording started: \(timeString)</p>"
             template = template.replacingOccurrences(of: "{{TIMESTAMP_SECTION}}", with: timeHtml)
-            template = template.replacingOccurrences(of: "{{TIMESTAMP}}", with: timeString)
         } else {
             template = template.replacingOccurrences(of: "{{TIMESTAMP_SECTION}}", with: "")
-            template = template.replacingOccurrences(of: "{{TIMESTAMP}}", with: "")
         }
         
         if let address = address, !address.isEmpty {

@@ -4,6 +4,10 @@ import SwiftUI
 import UIKit
 import GoogleSignIn
 
+enum AppTab: Hashable {
+    case record, clips, watch, settings
+}
+
 struct ContentView: View {
     @Environment(GoogleAuthManager.self) private var authManager
     @Environment(CameraManager.self) private var cameraManager
@@ -14,6 +18,10 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     
     @State private var signInError: String?
+    @State private var selectedTab: AppTab = .record
+    @AppStorage("emailAlertsEnabled") private var emailAlertsEnabled: Bool = true
+    @AppStorage("emailRecipients") private var emailRecipients: String = ""
+    @State private var settingsScrollTarget: SettingsSection?
     
     var body: some View {
         content
@@ -35,8 +43,7 @@ struct ContentView: View {
                 if signedIn {
                     // Drain anything left over from a previous launch or a
                     // previous sign-in: pending chunk uploads and unsent emails.
-                    uploadManager.resumePendingUploads(authManager: authManager)
-                    emailQueueManager.resumeAll(authManager: authManager)
+                    AppServices.shared.sweep()
                     Task { await uploadManager.checkPublicSharing(authManager: authManager) }
                 } else {
                     // Signing out hides the camera; don't keep recording unseen.
@@ -44,31 +51,52 @@ struct ContentView: View {
                     uploadManager.resetAccountState()
                 }
             }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    AppServices.shared.didBecomeActive()
+                } else {
+                    AppServices.shared.willLeaveForeground()
+                }
+            }
     }
     
+    /// Notifications are on but there's nobody to send them to. Switching
+    /// notifications off is a choice, so that doesn't get a badge.
+    private var needsContacts: Bool {
+        emailAlertsEnabled && EmailSettings.parseRecipients(emailRecipients).isEmpty
+    }
+
     @ViewBuilder
     private var content: some View {
         if authManager.isSignedIn {
-            TabView {
-                RecordingView()
+            TabView(selection: $selectedTab) {
+                RecordingView(openSettings: { section in
+                    settingsScrollTarget = section
+                    selectedTab = .settings
+                })
                     .tabItem {
                         Label("Record", systemImage: "video.fill")
                     }
+                    .tag(AppTab.record)
                 
                 DashboardView()
                     .tabItem {
                         Label("My Clips", systemImage: "square.stack.fill")
                     }
+                    .tag(AppTab.clips)
 
                 SharedView()
                     .tabItem {
                         Label("Watch", systemImage: "play.rectangle.fill")
                     }
+                    .tag(AppTab.watch)
 
-                SettingsView()
+                SettingsView(scrollTarget: $settingsScrollTarget)
                     .tabItem {
                         Label("Settings", systemImage: "gearshape.fill")
                     }
+                    .badge(needsContacts ? Text("!") : nil)
+                    .tag(AppTab.settings)
             }
             .tint(Theme.accent)
             .onChange(of: scenePhase) { _, newPhase in

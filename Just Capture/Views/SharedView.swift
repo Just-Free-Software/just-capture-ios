@@ -45,23 +45,25 @@ struct SharedView: View {
                             .plainRow()
                     } else {
                         ForEach(store.folders) { folder in
-                            Button {
+                            // A tap gesture rather than a Button around the
+                            // row, so the row's "more" menu gets its own taps.
+                            DriveFolderRow(
+                                title: folder.name,
+                                subtitle: subtitle(for: folder),
+                                newClipCount: folder.newClipCount,
+                                onDelete: { folderToDelete = folder }
+                            )
+                            .contentShape(.rect)
+                            .onTapGesture {
                                 playing = PlaybackTarget(id: folder.id, title: folder.name)
-                            } label: {
-                                DriveFolderRow(
-                                    title: folder.name,
-                                    subtitle: subtitle(for: folder),
-                                    newClipCount: folder.newClipCount
-                                )
                             }
-                            .buttonStyle(.plain)
-                            .plainRow()
-                            .swipeActions(edge: .trailing) {
-                                Button("Delete", systemImage: "trash") {
+                            .accessibilityAddTraits(.isButton)
+                            .contextMenu {
+                                Button("Delete from This Phone", systemImage: "trash", role: .destructive) {
                                     folderToDelete = folder
                                 }
-                                .tint(Theme.record)
                             }
+                            .plainRow()
                         }
                     }
                 } header: {

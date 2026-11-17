@@ -8,11 +8,15 @@ enum DeviceStorage {
     /// ...or when less than this many bytes are free, whichever is larger.
     static let lowBytesThreshold: Int64 = 1024 * 1024 * 1024
 
-    /// Space available for user-initiated saves like recordings. A local
-    /// filesystem query, so it's cheap to call repeatedly.
-    static func availableBytes() -> Int64? {
-        let values = try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return values?.volumeAvailableCapacityForImportantUsage
+    /// Space available for user-initiated saves like recordings. No network
+    /// is involved, but the system works out how much purgeable data it could
+    /// clear to answer, and that can take a while, so the query runs off the
+    /// main thread.
+    nonisolated static func availableBytes() async -> Int64? {
+        await Task.detached(priority: .userInitiated) {
+            let values = try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            return values?.volumeAvailableCapacityForImportantUsage
+        }.value
     }
 
     static func isLow(availableBytes: Int64, bytesPerSecond: Double) -> Bool {
