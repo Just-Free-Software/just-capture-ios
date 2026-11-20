@@ -30,6 +30,7 @@ struct SettingsView: View {
     @State private var isRefreshingStorage = false
     @State private var deviceFreeBytes: Int64?
     @State private var showSignOutConfirm = false
+    @State private var showHelp = false
 
     private enum Field: Hashable {
         case recipients, subject, note
@@ -132,10 +133,21 @@ struct SettingsView: View {
                     }
                 }
                 .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { showHelp = true } label: {
+                            Image(systemName: "questionmark.circle")
+                        }
+                        .accessibilityLabel("How it works")
+                    }
                     ToolbarItemGroup(placement: .keyboard) {
                         Spacer()
                         Button("Done") { focusedField = nil }
                     }
+                }
+                // A full-height sheet, so the help can be read without dragging it up.
+                .sheet(isPresented: $showHelp) {
+                    SettingsHelpView()
+                        .presentationDetents([.large])
                 }
                 .confirmationDialog("Sign out of Google?", isPresented: $showSignOutConfirm, titleVisibility: .visible) {
                     Button("Sign Out", role: .destructive) { authManager.signOut() }
