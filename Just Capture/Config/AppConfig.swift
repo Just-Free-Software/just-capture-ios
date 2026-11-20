@@ -26,4 +26,5 @@ enum AppConfig {
 
     static let homepageURL = URL(string: "https://justfreesoftware.fyi/just-capture/info")!
     static let privacyPolicyURL = URL(string: "https://justfreesoftware.fyi/just-capture/privacy-policy")!
+    static let termsURL = URL(string: "https://justfreesoftware.fyi/just-capture/terms")!
 }

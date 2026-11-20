@@ -210,11 +210,15 @@ private struct SignInView: View {
                     .padding(.horizontal, 40)
                     .padding(.top, 14)
 
-                Link("Privacy Policy", destination: AppConfig.privacyPolicyURL)
-                    .font(.caption)
-                    .foregroundStyle(Theme.secondaryText)
-                    .padding(.top, 8)
-                    .padding(.bottom, 24)
+                HStack(spacing: 8) {
+                    Link("Privacy Policy", destination: AppConfig.privacyPolicyURL)
+                    Text("·").foregroundStyle(Theme.tertiaryText)
+                    Link("Terms of Service", destination: AppConfig.termsURL)
+                }
+                .font(.caption)
+                .foregroundStyle(Theme.secondaryText)
+                .padding(.top, 8)
+                .padding(.bottom, 24)
             }
         }
     }
